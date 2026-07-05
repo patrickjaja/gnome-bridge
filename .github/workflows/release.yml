@@ -1,0 +1,117 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing git tag to release (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  GLIBC_FLOOR: "2.35"
+
+jobs:
+  build:
+    name: build (${{ matrix.arch_label }})
+    runs-on: ${{ matrix.runner }}
+    # Build inside jammy so release binaries honor the GLIBC 2.35 floor.
+    container: ubuntu:jammy
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch_label: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            arch_label: aarch64-linux
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev cmake curl ca-certificates \
+            git binutils libpipewire-0.3-dev
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Verify glibc floor
+        run: |
+          BIN="target/release/gnome-portal-bridge"
+          MAXVER="$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1)"
+          echo "highest required: ${MAXVER:-none} (floor GLIBC_${GLIBC_FLOOR})"
+          case "$MAXVER" in
+            ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-5]) : ;;
+            *) echo "FAIL: $BIN requires ${MAXVER} > GLIBC_${GLIBC_FLOOR}" >&2; exit 1 ;;
+          esac
+
+      - name: Stage archive
+        env:
+          ARCH_LABEL: ${{ matrix.arch_label }}
+        run: |
+          ARCHIVE="gnome-portal-bridge-${RELEASE_TAG}-${ARCH_LABEL}.tar.gz"
+          mkdir -p staged
+          cp target/release/gnome-portal-bridge staged/gnome-portal-bridge
+          tar -C staged -czf "$ARCHIVE" gnome-portal-bridge
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          echo "archive=$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: gnome-portal-bridge-${{ matrix.arch_label }}
+          path: |
+            ${{ env.archive }}
+            ${{ env.archive }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combined checksum manifest
+        run: |
+          cd dist
+          cat *.tar.gz.sha256 > SHA256SUMS
+          rm -f *.tar.gz.sha256
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          draft: true
+          generate_release_notes: true

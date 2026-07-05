@@ -1,0 +1,28 @@
+[package]
+name = "gnome-portal-bridge"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["patrickjaja"]
+description = "GNOME/Wayland portal + PipeWire support bridge for Linux computer-use tooling (Claude Desktop)."
+
+[dependencies]
+anyhow = "1.0.102"
+base64 = "0.22.1"
+clap = { version = "4.6.1", features = ["derive", "std", "help", "suggestions"], default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+lamco-portal = { version = "0.4.0", default-features = false }
+lamco-pipewire = { version = "0.4.2", default-features = false }
+ashpd = { version = "0.13.11", default-features = false, features = ["tokio"] }
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+serde = { version = "1.0.228", features = ["derive"], default-features = false }
+serde_json = { version = "1.0.149", default-features = false, features = ["std"] }
+tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"], default-features = false }
+libc = { version = "0.2.186", default-features = false, features = ["std"] }
+xkeysym = "0.2.1"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 8
+opt-level = 3

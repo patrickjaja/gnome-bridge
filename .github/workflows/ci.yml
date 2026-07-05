@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'feature/**'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Documented glibc floor (Ubuntu 22.04 jammy). The build job runs inside a
+  # jammy container so the produced binaries cannot require anything newer, and
+  # the floor-check step enforces it.
+  GLIBC_FLOOR: "2.35"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang libclang-dev libpipewire-0.3-dev
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  build:
+    name: build + test (${{ matrix.arch_label }})
+    runs-on: ${{ matrix.runner }}
+    # Build inside jammy so the glibc floor is 2.35 (the runner OS is newer).
+    container: ubuntu:jammy
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch_label: x86_64
+          - runner: ubuntu-24.04-arm
+            arch_label: aarch64
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            build-essential pkg-config clang libclang-dev cmake curl ca-certificates \
+            git binutils libpipewire-0.3-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: cargo build (release)
+        run: cargo build --release --locked
+
+      - name: cargo test
+        run: cargo test --locked
+
+      - name: Verify glibc floor
+        run: |
+          BIN="target/release/gnome-portal-bridge"
+          echo ">>> GLIBC symbol versions required by $BIN:"
+          objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | uniq -c
+          MAXVER="$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1)"
+          echo "highest required: ${MAXVER:-none} (floor GLIBC_${GLIBC_FLOOR})"
+          case "$MAXVER" in
+            ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-5]) : ;;
+            *) echo "FAIL: $BIN requires ${MAXVER} > GLIBC_${GLIBC_FLOOR}" >&2; exit 1 ;;
+          esac
+          echo "OK: within the GLIBC_${GLIBC_FLOOR} floor"
