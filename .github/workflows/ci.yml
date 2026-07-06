@@ -17,10 +17,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Documented glibc floor (Ubuntu 22.04 jammy). The build job runs inside a
-  # jammy container so the produced binaries cannot require anything newer, and
+  # Documented glibc floor (Ubuntu 24.04 noble). lamco-pipewire calls PipeWire
+  # APIs (pw_stream_get_nsec, extended pw_time) that need PipeWire >= 1.0.5,
+  # so noble is the oldest viable base. The build job runs inside a noble
+  # container so the produced binaries cannot require anything newer, and
   # the floor-check step enforces it.
-  GLIBC_FLOOR: "2.35"
+  GLIBC_FLOOR: "2.39"
 
 jobs:
   lint:
@@ -50,8 +52,8 @@ jobs:
   build:
     name: build + test (${{ matrix.arch_label }})
     runs-on: ${{ matrix.runner }}
-    # Build inside jammy so the glibc floor is 2.35 (the runner OS is newer).
-    container: ubuntu:jammy
+    # Build inside noble so the glibc floor is 2.39.
+    container: ubuntu:noble
     strategy:
       fail-fast: false
       matrix:
@@ -92,7 +94,7 @@ jobs:
           MAXVER="$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1)"
           echo "highest required: ${MAXVER:-none} (floor GLIBC_${GLIBC_FLOOR})"
           case "$MAXVER" in
-            ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-5]) : ;;
+            ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-9]) : ;;
             *) echo "FAIL: $BIN requires ${MAXVER} > GLIBC_${GLIBC_FLOOR}" >&2; exit 1 ;;
           esac
           echo "OK: within the GLIBC_${GLIBC_FLOOR} floor"

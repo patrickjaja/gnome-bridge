@@ -184,11 +184,17 @@ keyname  := <CU key-name> | <single literal char>
   X11 bridge). Arbitrary characters map to their keysym, using the Unicode-plane
   encoding (`0x01000000 | codepoint`) for glyphs with no named keysym.
 
-## glibc floor
+## glibc + PipeWire floor
 
 Built as a **glibc-dynamic** binary (it links `libpipewire-0.3` via
-`lamco-pipewire`), not static-musl like x11-bridge. The floor is **glibc 2.35**
-(Ubuntu 22.04 jammy), the oldest base that ships a new-enough
-`libpipewire-0.3-dev` (0.3.48 >= the 0.3.33 `lamco-pipewire` requires) while
-still covering Debian 12 bookworm (2.36 / GNOME 43). CI builds inside a jammy
-container and enforces the floor with `objdump -T | grep GLIBC_`.
+`lamco-pipewire`), not static-musl like x11-bridge. The floor is **glibc 2.39 +
+PipeWire 1.0.5** (Ubuntu 24.04 noble). `lamco-pipewire` 0.4.x declares a
+0.3.33 pkg-config minimum, but that metadata is wrong: it calls
+`pw_stream_get_nsec` (PipeWire >= 1.0.x), `pw_stream_get_time_n` and the
+extended `pw_time` fields (>= 0.3.50), and `libspa` 0.9.x needs the
+`spa_video_info_raw` layout with `flags`/u64 `modifier` (>= 0.3.65). Older
+bases fail at compile (bindgen sees the old structs) AND at runtime (Rust
+links BIND_NOW; the missing `.so` symbols abort startup) - so Ubuntu 22.04
+(0.3.48) and Debian 12 (0.3.65) cannot be supported with this dependency.
+CI builds inside a noble container and enforces the floor with
+`objdump -T | grep GLIBC_`.

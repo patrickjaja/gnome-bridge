@@ -15,14 +15,15 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-  GLIBC_FLOOR: "2.35"
+  GLIBC_FLOOR: "2.39"
 
 jobs:
   build:
     name: build (${{ matrix.arch_label }})
     runs-on: ${{ matrix.runner }}
-    # Build inside jammy so release binaries honor the GLIBC 2.35 floor.
-    container: ubuntu:jammy
+    # Build inside noble so release binaries honor the GLIBC 2.39 floor
+    # (lamco-pipewire needs PipeWire >= 1.0.5, first available on noble).
+    container: ubuntu:noble
     strategy:
       fail-fast: true
       matrix:
@@ -60,7 +61,7 @@ jobs:
           MAXVER="$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -V | tail -1)"
           echo "highest required: ${MAXVER:-none} (floor GLIBC_${GLIBC_FLOOR})"
           case "$MAXVER" in
-            ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-5]) : ;;
+            ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-9]) : ;;
             *) echo "FAIL: $BIN requires ${MAXVER} > GLIBC_${GLIBC_FLOOR}" >&2; exit 1 ;;
           esac
 

@@ -102,9 +102,12 @@ cargo build --release
 ```
 
 The binary links `libpipewire-0.3` dynamically (glibc-dynamic, not static). The
-glibc floor is **2.35** (Ubuntu 22.04 jammy), the oldest base with a new-enough
-libpipewire that still covers Debian 12 bookworm; CI builds inside jammy and
-verifies the floor via `objdump`.
+floor is **glibc 2.39 + PipeWire 1.0.5** (Ubuntu 24.04 noble): `lamco-pipewire`
+calls `pw_stream_get_nsec` / `pw_stream_get_time_n` and the extended `pw_time`
+fields, which older PipeWire (Ubuntu 22.04's 0.3.48, Debian 12's 0.3.65) neither
+compiles against nor provides at runtime - Rust links BIND_NOW, so the binary
+fails at startup there. Supported: Ubuntu 24.04+, Fedora 40+, Debian 13+, Arch.
+CI builds inside noble and verifies the floor via `objdump`.
 
 ## License
 

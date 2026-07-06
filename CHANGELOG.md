@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## 2026-07-06
 
+### Changed
+
+- Build base raised from `ubuntu:jammy` to `ubuntu:noble`; the floor is now
+  **glibc 2.39 + PipeWire 1.0.5** (Ubuntu 24.04+, Fedora 40+, Debian 13+).
+  `lamco-pipewire` 0.4.x declares a 0.3.33 pkg-config minimum but actually
+  calls `pw_stream_get_nsec` / `pw_stream_get_time_n` and the extended
+  `pw_time` fields (PipeWire >= 1.0.x), and `libspa` 0.9.x needs the
+  post-0.3.65 `spa_video_info_raw` layout - so the previously documented
+  jammy floor (Ubuntu 22.04 / Debian 12) never compiled and could never have
+  run (Rust links BIND_NOW; the missing symbols abort startup). CI, the local
+  pipeline script, README, and DESIGN were updated; manifest deps bumped to
+  the locked `lamco-portal` 0.4.2 / `lamco-pipewire` 0.4.5.
+
 ### Added
 
 - Initial v0.1.0 of `gnome-portal-bridge`, the first-party GNOME/Wayland backend

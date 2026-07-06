@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # Reproduce the CI cross-build pipeline against the local source tree.
 #
-# Base image is ubuntu:jammy (glibc 2.35) - the oldest base that ships a
-# new-enough libpipewire-0.3-dev (0.3.48 >= the 0.3.33 floor lamco-pipewire
-# requires) AND covers every supported GNOME-Wayland distro: Ubuntu 22.04
-# (glibc 2.35, GNOME 42) and Debian 12 bookworm (glibc 2.36, GNOME 43). A
-# newer base (noble, 2.39) would raise the glibc floor and drop jammy.
+# Base image is ubuntu:noble (glibc 2.39, PipeWire 1.0.5) - the oldest base
+# whose PipeWire satisfies what lamco-pipewire 0.4.x actually calls:
+# pw_stream_get_nsec, pw_stream_get_time_n, and the extended pw_time fields
+# (PipeWire >= 1.0.5), plus the spa_video_info_raw layout libspa 0.9.x needs
+# (>= 0.3.65). Note lamco-pipewire DECLARES a 0.3.33 pkg-config floor, but
+# that metadata is wrong - jammy (0.3.48) and Debian 12 (0.3.65) can neither
+# compile nor load the binary (Rust links BIND_NOW, missing .so symbols fail
+# at startup). Runtime floor: Ubuntu 24.04+, Fedora 40+, Debian 13+.
 #
 # Unlike x11-bridge (pure Rust, static musl), this bridge links libpipewire
 # dynamically via lamco-pipewire, so it is a glibc-dynamic build. The pipewire
@@ -21,7 +24,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/dist}"
 CACHE_DIR="${CACHE_DIR:-${REPO_ROOT}/.pipeline-cache}"
-IMAGE="${IMAGE:-ubuntu:jammy}"
+IMAGE="${IMAGE:-ubuntu:noble}"
 RUST_VERSION="${RUST_VERSION:-stable}"
 
 mkdir -p "${OUTPUT_DIR}"
@@ -50,17 +53,31 @@ docker run --rm \
     set -eo pipefail
 
     # --- multiarch apt: split host (amd64) and ports (arm64) ---
-    # Jammy still uses the classic one-line sources.list. Rewrite it so the
-    # amd64 entries point at archive.ubuntu.com and the arm64 entries at
-    # ports.ubuntu.com (archive 404s for non-x86 arches).
+    # Noble uses deb822 sources. Rewrite ubuntu.sources so the amd64 entries
+    # point at archive.ubuntu.com and the arm64 entries at ports.ubuntu.com
+    # (archive 404s for non-x86 arches).
     dpkg --add-architecture arm64
-    cat >/etc/apt/sources.list <<SOURCES
-deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
-deb [arch=amd64] http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
-deb [arch=amd64] http://security.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
-deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy main restricted universe multiverse
-deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-updates main restricted universe multiverse
-deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports jammy-security main restricted universe multiverse
+    cat >/etc/apt/sources.list.d/ubuntu.sources <<SOURCES
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu
+Suites: noble-security
+Components: main restricted universe multiverse
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://ports.ubuntu.com/ubuntu-ports
+Suites: noble noble-updates noble-security
+Components: main restricted universe multiverse
+Architectures: arm64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 SOURCES
 
     apt-get update
@@ -109,18 +126,18 @@ SOURCES
     cp /build/target/aarch64-unknown-linux-gnu/release/gnome-portal-bridge /output/gnome-portal-bridge-aarch64
     echo "gnome-portal-bridge aarch64 built successfully"
 
-    # --- glibc floor verification (must be <= 2.35 for jammy) ---
+    # --- glibc floor verification (must be <= 2.39 for noble) ---
     for f in /output/gnome-portal-bridge /output/gnome-portal-bridge-aarch64; do
       echo ">>> GLIBC symbol versions in $f:"
       MAXVER=$(objdump -T "$f" 2>/dev/null | grep -oE "GLIBC_[0-9]+\.[0-9]+" | sort -V | tail -1)
       echo "    highest: ${MAXVER:-none}"
-      # 2.35 is the jammy floor; fail if anything above it slips in.
+      # 2.39 is the noble floor; fail if anything above it slips in.
       case "$MAXVER" in
-        ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-5]) : ;;
-        *) echo "FAIL: $f requires ${MAXVER} > GLIBC_2.35 (jammy floor)" >&2; exit 1 ;;
+        ""|GLIBC_2.1[0-9]|GLIBC_2.2[0-9]|GLIBC_2.3[0-9]) : ;;
+        *) echo "FAIL: $f requires ${MAXVER} > GLIBC_2.39 (noble floor)" >&2; exit 1 ;;
       esac
     done
-    echo "both binaries respect the GLIBC 2.35 floor"
+    echo "both binaries respect the GLIBC 2.39 floor"
   '
 
 echo
