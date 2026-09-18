@@ -15,7 +15,7 @@
 //! the kwin-portal-bridge precedent, the socket is NOT suffixed with
 //! `CLAUDE_PROFILE`: the daemon is spawned per-CU-session by the app that owns
 //! it, and there is exactly one active tool-use lock per running app instance,
-//! so a fixed per-user path is correct. (Per the claude-desktop-bin profile
+//! so a fixed per-user path is correct. (Per the claude-desktop-extra profile
 //! rule, profile isolation for app-owned resources comes from per-profile state
 //! inherited via env, not from suffixing this socket.)
 

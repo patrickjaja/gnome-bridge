@@ -1,7 +1,7 @@
 # gnome-portal-bridge
 
 A first-party Rust bridge that makes Anthropic's Computer Use tooling work on
-**GNOME under Wayland**. Paired with `claude-desktop-bin`, it replaces the
+**GNOME under Wayland**. Paired with `claude-desktop-extra`, it replaces the
 fragile shell-out chain the JS executor uses on GNOME today with a single
 bundled binary, and adds best-effort window enumeration that GNOME otherwise
 lacks.

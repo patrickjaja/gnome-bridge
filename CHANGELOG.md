@@ -70,4 +70,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Portal runtime paths (consent, input injection, capture) are **unverified** on
   the development machine (X11, no GNOME); see `scripts/manual-test-gnome.md` for
   the GNOME verification steps. Wiring the binary into
-  `claude-desktop-bin`'s `js/executor_linux.js` is a separate follow-up.
+  `claude-desktop-extra`'s `js/executor_linux.js` is a separate follow-up.

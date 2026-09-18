@@ -10,7 +10,7 @@ It is the GNOME sibling of `kwin-portal-bridge` (KDE/Wayland) and `x11-bridge`
 (X11 / XWayland) and speaks the **same JSON contract**, so the JS executor treats
 all three interchangeably.
 
-- **Invoked by:** `js/executor_linux.js` in `claude-desktop-bin`, via
+- **Invoked by:** `js/cu_linux_executor.js` in `claude-desktop-extra`, via
   `execFile(bin, [subcommand, ...args])`, reading `JSON.parse(stdout.trim())`.
   The binary name resolves from `$GNOME_PORTAL_BRIDGE_BIN`, else
   `globalThis.__cuGnomeBridgeBin` (set in `cu_mode_preamble.js`), else the app
@@ -52,7 +52,7 @@ kwin-portal-bridge precedent, it is **not** suffixed with `CLAUDE_PROFILE`: the
 daemon is app-owned and spawned per-CU-session, with one active lock per running
 app instance, so a fixed per-user path is correct. Profile isolation for
 app-owned resources comes from per-profile state inherited via env, not from
-suffixing this socket (per the claude-desktop-bin profile rule).
+suffixing this socket (per the claude-desktop-extra profile rule).
 
 ## Consent dialog & persistence
 
