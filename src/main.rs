@@ -8,6 +8,7 @@ mod input;
 mod output;
 mod portal;
 mod screens;
+mod stopped;
 mod token_store;
 mod windows;
 
@@ -25,7 +26,8 @@ use crate::output::print_json;
 
 /// Exit codes follow the Computer Use bridge CLI contract v1: 0 success,
 /// 1 runtime error, 2 bad usage (clap), 3 monitor not shared in the portal
-/// session, 4 no live portal session (see `error_kind`).
+/// session, 4 no live portal session, 5 the user stopped screen sharing (see
+/// `error_kind` and `stopped`).
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -39,6 +41,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // Contract v1 exit 5: after the user stopped screen sharing, input and
+    // capture fail here, before a screen lookup or the daemon proxy could
+    // open a portal session of their own (a remembered grant would restart
+    // sharing without asking).
+    if uses_portal(&cli.command) {
+        stopped::gate()?;
+    }
 
     match cli.command {
         Command::Doctor => {
@@ -192,6 +202,7 @@ async fn run() -> Result<()> {
 
         Command::SessionStart { foreground } => {
             if foreground {
+                stopped::clear();
                 // Run the daemon in the foreground (blocks until SIGTERM). The
                 // socket is prepared here so a subsequent connect works.
                 let socket = daemon::socket_path()?;
@@ -205,6 +216,7 @@ async fn run() -> Result<()> {
             print_json(&stop_session_daemon().await?)?;
         }
         Command::ForgetSession => {
+            // `stop_session_daemon` (inside) removes the stopped marker.
             print_json(&daemon::forget_session().await?)?;
         }
         Command::ServeSession { socket } => {
@@ -214,6 +226,36 @@ async fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Commands that talk to the portal session (input and capture): blocked
+/// while the stopped-by-user marker exists. Listing, diagnostics and the
+/// session lifecycle commands never open a portal session of their own.
+fn uses_portal(command: &Command) -> bool {
+    match command {
+        Command::Screenshot { .. }
+        | Command::Zoom { .. }
+        | Command::PointerMove { .. }
+        | Command::PointerClick { .. }
+        | Command::PointerScroll { .. }
+        | Command::PointerDrag { .. }
+        | Command::LeftMouseDown
+        | Command::LeftMouseUp
+        | Command::KeySequence { .. }
+        | Command::Type { .. }
+        | Command::HoldKey { .. } => true,
+        Command::Doctor
+        | Command::Screens
+        | Command::Windows
+        | Command::CursorPosition
+        | Command::FrontmostApp
+        | Command::AppUnderPoint { .. }
+        | Command::ActivateWindow { .. }
+        | Command::SessionStart { .. }
+        | Command::SessionEnd
+        | Command::ForgetSession
+        | Command::ServeSession { .. } => false,
+    }
 }
 
 /// The daemon must never outlive its session: a PipeWire or portal thread that
@@ -245,4 +287,56 @@ async fn resolve_screen_for_point(x: i32, y: i32) -> Result<output::Screen> {
     }
     // Outside every monitor: the default screen, preferring shared ones.
     resolve_screen(None).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> Command {
+        let mut argv = vec!["gnome-portal-bridge"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap().command
+    }
+
+    #[test]
+    fn input_and_capture_are_gated_listing_and_lifecycle_are_not() {
+        for args in [
+            &["screenshot"][..],
+            &["zoom", "--x", "0", "--y", "0", "--w", "1", "--h", "1"],
+            &["pointer-move", "--x", "1", "--y", "1"],
+            &["pointer-click", "--x", "1", "--y", "1"],
+            &["pointer-scroll", "--x", "1", "--y", "1"],
+            &[
+                "pointer-drag",
+                "--from-x",
+                "0",
+                "--from-y",
+                "0",
+                "--to-x",
+                "1",
+                "--to-y",
+                "1",
+            ],
+            &["left-mouse-down"],
+            &["left-mouse-up"],
+            &["key-sequence", "--keys", "a"],
+            &["type", "--text", "a"],
+            &["hold-key", "--key", "a", "--duration-ms", "1"],
+        ] {
+            assert!(uses_portal(&command(args)), "{args:?}");
+        }
+        for args in [
+            &["doctor"][..],
+            &["screens"],
+            &["windows"],
+            &["frontmost-app"],
+            &["app-under-point", "--x", "1", "--y", "1"],
+            &["session-start"],
+            &["session-end"],
+            &["forget-session"],
+        ] {
+            assert!(!uses_portal(&command(args)), "{args:?}");
+        }
+    }
 }

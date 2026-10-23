@@ -2,10 +2,11 @@
 //!
 //! The leading keys are the Computer Use bridge CLI contract v1 (`contract`
 //! .. `session_socket`, read by claude-desktop-extra's launcher and
-//! executors); the rest are bridge-specific extras for humans: the desktop
-//! environment, the RemoteDesktop / ScreenCast portal versions, the GNOME
-//! Shell version, whether the Shell Introspect API is callable (drives
-//! whether `windows` returns data), and the daemon log path.
+//! executors), then the contract's optional `stopped_by_user`; the rest are
+//! bridge-specific extras for humans: the desktop environment, the
+//! RemoteDesktop / ScreenCast portal versions, the GNOME Shell version,
+//! whether the Shell Introspect API is callable (drives whether `windows`
+//! returns data), and the daemon log path.
 //!
 //! `doctor` never opens a portal session, never creates a file or directory,
 //! and exits 0 even when the session bus is unreachable: every D-Bus call is a
@@ -47,6 +48,10 @@ pub struct DoctorReport {
     pub restore_token_path: Option<String>,
     pub daemon_running: bool,
     pub session_socket: Option<String>,
+    // ---- contract v1, optional ----
+    /// The stopped-by-user marker exists: the user stopped screen sharing and
+    /// input/capture exit 5 until the next `session-start`.
+    pub stopped_by_user: bool,
     // ---- bridge-specific ----
     pub xdg_current_desktop: String,
     pub xdg_session_type: String,
@@ -258,6 +263,7 @@ pub async fn doctor() -> DoctorReport {
         session_socket: daemon::socket_path()
             .ok()
             .map(|path| path.display().to_string()),
+        stopped_by_user: crate::stopped::is_set(),
         xdg_current_desktop: current_desktop.unwrap_or_else(|| "<unset>".to_owned()),
         xdg_session_type: session_type.unwrap_or_else(|| "<unset>".to_owned()),
         portal_present,

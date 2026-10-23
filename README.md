@@ -69,6 +69,12 @@ selection, run `gnome-portal-bridge forget-session` (ends the session and
 deletes the stored restore token; a plain `session-end` would replay the same
 selection), then start again and select all monitors in the dialog.
 
+Clicking GNOME's screen-sharing indicator in the top bar stops the session:
+the daemon exits, and input and capture commands exit 5 (`screen sharing was
+stopped (the portal session was closed by the user or the desktop)`) without opening a new portal session, until the next
+`session-start` (or `session-end` / `forget-session`). `doctor` reports
+`"stopped_by_user": true` meanwhile.
+
 ## Usage
 
 ```sh
@@ -96,8 +102,8 @@ shared by every claude-desktop-extra bridge: `doctor` starts with the contract
 keys (`contract`, `bridge`, `version`, `backend`, `session_match`,
 `backend_reachable`, `restore_token_path`, `session_socket`, ...) and never
 opens a portal session; errors exit 1, bad usage 2, a monitor that is not
-shared 3, no live portal session 4; `session-end` / `forget-session` report
-`ended` and `daemon`. `tests/contract.rs` checks it. Details in
+shared 3, no live portal session 4, the user stopped screen sharing 5;
+`session-end` / `forget-session` report `ended` and `daemon`. `tests/contract.rs` checks it. Details in
 [DESIGN.md](DESIGN.md#cli-contract-v1).
 
 ## Binary resolution (for the JS executor)

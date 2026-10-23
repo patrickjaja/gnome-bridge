@@ -19,7 +19,8 @@ all three interchangeably.
   workstream.)
 - **Output:** exactly one JSON object/array on stdout. Errors: a human message on
   stderr and **exit code 1** (3: monitor not shared, 4: no live portal
-  session, see [CLI contract v1](#cli-contract-v1)). clap parse errors exit 2.
+  session, 5: the user stopped screen sharing, see
+  [CLI contract v1](#cli-contract-v1)). clap parse errors exit 2.
 
 ## Engine
 
@@ -278,20 +279,68 @@ every bridge:
   bounded to 1.5 s. It never opens a portal session and creates nothing.
 - Exit codes: 0 ok, 1 runtime error, 2 bad usage, 3 the monitor is not shared
   in the live portal session, 4 no live portal session (the message contains
-  `no active portal session`). The kind is attached where the error starts
+  `no active portal session`), 5 the user stopped screen sharing (see below).
+  The kind is attached where the error starts
   (`src/error_kind.rs`) and crosses the daemon socket as `error_kind`
-  (`not_shared`, `no_session`) next to the error text, so the client never
+  (`not_shared`, `no_session`, `stopped_by_user`) next to the error text, so the client never
   parses text. A reply without `error_kind` (a daemon from before the upgrade
   still running) or with an unknown kind exits 1.
 - Files: restore token `${XDG_STATE_HOME:-$HOME/.local/state}/gnome-portal-bridge/restore-token.json`,
-  session socket `${XDG_RUNTIME_DIR:-/tmp}/gnome-portal-bridge/session.sock`
-  (an empty variable counts as unset).
+  session socket `${XDG_RUNTIME_DIR:-/tmp}/gnome-portal-bridge/session.sock`,
+  stopped-by-user marker `${XDG_RUNTIME_DIR:-/tmp}/gnome-portal-bridge/stopped-by-user`
+  (an empty variable counts as unset). `doctor` adds the optional
+  `stopped_by_user` (the marker exists).
 - `tests/contract.rs` checks the contract against the built binary in a clean
   environment.
 
 Not covered by exit 4: with no daemon at all, action commands still fall back
-to an ephemeral portal session (see "Daemon vs ephemeral"), and a portal
-session the user stopped from the GNOME panel is not detected as such.
+to an ephemeral portal session (see "Daemon vs ephemeral").
+
+### Stopped by the user (exit 5)
+
+While a session runs, GNOME Shell shows a screen-sharing indicator in the top
+bar; clicking it stops every remote-access handle (Mutter stops its
+RemoteDesktop session). The portal then emits
+`org.freedesktop.portal.Session::Closed`, unicast to the connection that
+created the session (it does not emit it when the client itself calls
+`Close`). `LivePortalSession` subscribes right after `CreateSession`, on
+ashpd's connection (`ClosedWatch` in `src/portal.rs`); without a subscription
+nothing changes.
+
+- **Idle daemon:** on `Closed` it writes the marker (one line, the Unix
+  time), gives up its socket and pidfile (ownership-checked), runs the
+  bounded teardown and exits 0. Measured on GNOME 51: gone 0.28 s after the
+  indicator click.
+- **Request in flight:** actions (not `Ping` / `Shutdown` / `Screens`) race
+  `Closed`; when it wins, the action is abandoned and the reply is
+  `stopped_by_user`. A failure (other than `not_shared`) that `Closed`
+  follows within 500 ms counts as the stop too: the PipeWire stream or a
+  portal call can fail a moment before the signal arrives. A PipeWire stream
+  ending without `Closed` stays the old error (exit 4 or 1).
+- **Marker before release:** the marker is written before the socket goes,
+  so a client that finds no daemon also finds the marker.
+- **Clients:** while the marker exists, every input and capture command
+  (`screenshot`, `zoom`, `pointer-*`, `left-mouse-*`, `key-sequence`,
+  `type`, `hold-key`) exits 5 before it resolves a screen or contacts the
+  daemon, so no ephemeral session opens: with a remembered grant that
+  would restart sharing without a dialog right after the user stopped it.
+  `run_action` checks again before the ephemeral fallback, and a daemon
+  reply lost to a transport error while the marker exists is exit 5 too.
+  `windows`, `doctor` and the Shell-Introspect commands are not affected;
+  `screens` lists from Mutter as usual and exits 5 only without Mutter and
+  without a daemon (its fallback is the gated ephemeral session).
+- **Before ready:** a daemon whose session closes before it answered
+  `session-start`'s first ping exits with the marker set; `session-start`
+  then exits 5 and does not spawn a replacement (that would share again in
+  the same task).
+- **Wording:** Mutter also closes the session when a shared monitor is
+  unplugged or a stream fails, so the message is neutral: `screen sharing
+  was stopped (the portal session was closed by the user or the desktop)`.
+  The kind stays `stopped_by_user`.
+- **Cleared by** `session-start` (a new Computer Use task; again just before
+  it spawns, in case a stopping daemon wrote the marker meanwhile),
+  `session-start --foreground`, `session-end` and `forget-session` (after
+  the daemon is reaped).
 
 ## Screens & windows
 

@@ -32,6 +32,13 @@
 //! RemoteDesktop.SelectDevices ONLY - see the session-setup section below for
 //! why. On RemoteDesktop v1 (GNOME <= 45) there is no persistence, so a dialog
 //! appears once per session (accepted by design).
+//!
+//! Stopped by the user: GNOME's screen-sharing indicator can stop the session
+//! at any time. Mutter then stops its RemoteDesktop session and the portal
+//! emits `org.freedesktop.portal.Session::Closed` (only when the session is
+//! closed from the other side - our own `Close` emits nothing). Every session
+//! subscribes to it right after `CreateSession` (see [`ClosedWatch`]); the
+//! daemon turns it into exit 5 (see `stopped`).
 
 use std::collections::HashSet;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
@@ -115,6 +122,132 @@ pub struct LivePortalSession {
     /// Why the session can no longer capture (its PipeWire connection could
     /// not be rebuilt); the daemon ends itself after reporting it.
     dead: Option<String>,
+    /// Fires when the portal closes the session from its side.
+    closed: ClosedWatch,
+}
+
+/// The portal's `Session::Closed` signal for one session, received by a
+/// background task on the connection that created the session (the portal
+/// sends the signal to that connection only). Without a subscription (the
+/// AddMatch failed) it never fires, which is the behavior from before.
+pub struct ClosedWatch {
+    rx: Option<tokio::sync::watch::Receiver<bool>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ClosedWatch {
+    /// Subscribe to `Closed` on `session`. Must run before `Start`, so a
+    /// session the user stops right away is not missed.
+    async fn subscribe(
+        remote_desktop: &RemoteDesktop,
+        session: &ashpd::desktop::Session<RemoteDesktop>,
+    ) -> Self {
+        match closed_signal_stream(remote_desktop, session).await {
+            Ok(mut stream) => {
+                let (tx, rx) = tokio::sync::watch::channel(false);
+                let task = tokio::spawn(async move {
+                    use std::pin::Pin;
+                    use zbus::export::futures_core::Stream as _;
+                    let next = std::future::poll_fn(|cx| Pin::new(&mut stream).poll_next(cx)).await;
+                    if next.is_some() {
+                        tx.send_replace(true);
+                    }
+                    // Keep `tx` (and so `rx`'s value) until the receiver is
+                    // gone; a dropped sender would make `wait` return early.
+                    tx.closed().await;
+                });
+                Self {
+                    rx: Some(rx),
+                    task: Some(task),
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "gnome-portal-bridge: cannot watch the portal session's Closed signal \
+                     ({error:#}); a stop from the screen-sharing indicator will not be detected"
+                );
+                Self {
+                    rx: None,
+                    task: None,
+                }
+            }
+        }
+    }
+
+    /// A handle the daemon loop can wait on.
+    pub fn signal(&self) -> ClosedSignal {
+        ClosedSignal(self.rx.clone())
+    }
+}
+
+impl Drop for ClosedWatch {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// A cloneable view of a [`ClosedWatch`].
+#[derive(Clone)]
+pub struct ClosedSignal(Option<tokio::sync::watch::Receiver<bool>>);
+
+impl ClosedSignal {
+    /// A signal that never fires (tests, unsubscribed sessions).
+    #[cfg(test)]
+    pub fn never() -> Self {
+        Self(None)
+    }
+
+    /// A signal driven by hand (tests).
+    #[cfg(test)]
+    pub fn manual() -> (tokio::sync::watch::Sender<bool>, Self) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (tx, Self(Some(rx)))
+    }
+
+    /// Whether the portal closed the session.
+    pub fn is_closed(&self) -> bool {
+        self.0.as_ref().is_some_and(|rx| *rx.borrow())
+    }
+
+    /// Resolve once the portal closed the session; never without a
+    /// subscription.
+    pub async fn wait(&self) {
+        match self.0.clone() {
+            Some(mut rx) => {
+                if rx.wait_for(|closed| *closed).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// The `Closed` signal stream of a portal session, on the connection that
+/// created it.
+async fn closed_signal_stream(
+    remote_desktop: &RemoteDesktop,
+    session: &ashpd::desktop::Session<RemoteDesktop>,
+) -> Result<zbus::proxy::SignalStream<'static>> {
+    // ashpd keeps the session's object path private; its Serialize writes it.
+    let path = match serde_json::to_value(session).context("cannot read the session path")? {
+        serde_json::Value::String(path) => path,
+        other => bail!("unexpected session path encoding: {other}"),
+    };
+    let proxy = zbus::Proxy::new_owned(
+        remote_desktop.connection().clone(),
+        "org.freedesktop.portal.Desktop",
+        path,
+        "org.freedesktop.portal.Session",
+    )
+    .await
+    .context("cannot create a Session proxy")?;
+    proxy
+        .receive_signal("Closed")
+        .await
+        .context("cannot subscribe to Session::Closed")
 }
 
 /// The screen the pointer was last sent to, and the flush nudge's first
@@ -133,7 +266,7 @@ struct PipeWire {
 impl LivePortalSession {
     /// Open a new portal session, reusing a persisted restore token if present.
     pub async fn open() -> Result<Self> {
-        let (manager, session, _restore_token) = start_session().await?;
+        let (manager, (session, closed), _restore_token) = start_session().await?;
         let streams = session
             .streams()
             .iter()
@@ -153,7 +286,14 @@ impl LivePortalSession {
             pointer_target: None,
             pointer_input_pending: false,
             dead: None,
+            closed,
         })
+    }
+
+    /// The portal's `Session::Closed` for this session (the user stopped
+    /// sharing from GNOME's indicator, or the compositor ended it).
+    pub fn closed_signal(&self) -> ClosedSignal {
+        self.closed.signal()
     }
 
     /// Screens derived from the portal streams, used as a fallback when the
@@ -951,7 +1091,11 @@ fn resolve_key_spec(spec: &str) -> Result<Vec<u32>> {
 // `PortalManager` is still used for the input path (`remote_desktop()` holds
 // the proxy the `notify_*` calls go through); only session creation is ours.
 
-async fn start_session() -> Result<(PortalManager, PortalSessionHandle, Option<String>)> {
+async fn start_session() -> Result<(
+    PortalManager,
+    (PortalSessionHandle, ClosedWatch),
+    Option<String>,
+)> {
     let token_store = TokenStore::new()?;
     let saved_token = token_store.load().unwrap_or(None);
 
@@ -1008,11 +1152,12 @@ async fn try_start_session(
     config: &PortalConfig,
     restore_token: Option<String>,
     persistence: Persistence,
-) -> Result<(PortalSessionHandle, Option<String>)> {
+) -> Result<((PortalSessionHandle, ClosedWatch), Option<String>)> {
     let session = remote_desktop
         .create_session(Default::default())
         .await
         .context("failed to create the RemoteDesktop portal session")?;
+    let closed = ClosedWatch::subscribe(remote_desktop, &session).await;
 
     let result =
         select_and_start(remote_desktop, config, &session, restore_token, persistence).await;
@@ -1026,7 +1171,7 @@ async fn try_start_session(
                 Some(session_id),
                 session,
             );
-            Ok((handle, token))
+            Ok(((handle, closed), token))
         }
         Err(error) => {
             // Close the half-built session so the portal does not keep stale

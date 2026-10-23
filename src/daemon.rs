@@ -12,6 +12,13 @@
 //! repeated setup cost within a lock. Only an ABSENT daemon falls back; a
 //! daemon that is there but fails returns its error (see `run_action`).
 //!
+//! When the user stops screen sharing from GNOME's indicator, the portal
+//! closes the daemon's session: the daemon writes the stopped-by-user marker
+//! (see `stopped`), gives up its socket and pidfile, tears down and exits. A
+//! request in flight at that moment gets `stopped_by_user` (exit 5), and so
+//! does every later input or capture command until a new `session-start` -
+//! without the ephemeral fallback, which would restart sharing silently.
+//!
 //! Socket path: `$XDG_RUNTIME_DIR/gnome-portal-bridge/session.sock`. Following
 //! the kwin-portal-bridge precedent, the socket is NOT suffixed with
 //! `CLAUDE_PROFILE`: the daemon is spawned per-CU-session by the app that owns
@@ -39,8 +46,9 @@ use tokio::signal::unix::{SignalKind, signal};
 use crate::error_kind::{ErrorKind, kind_of, kinded};
 use crate::input::Button;
 use crate::output::Screen;
-use crate::portal::LivePortalSession;
+use crate::portal::{ClosedSignal, LivePortalSession};
 use crate::screens::{self};
+use crate::stopped;
 
 /// One request over the session socket. Screen resolution happens client-side
 /// where the Mutter connection lives, so requests carry a resolved `Screen`.
@@ -115,6 +123,12 @@ impl SessionRequest {
     /// the daemon serves one request at a time, so a click queued behind a
     /// slow request could otherwise land long after the caller gave up.
     /// `LeftMouseUp` is exempt - releasing a held button is always safe.
+    /// Requests that use the portal session (input and capture), as opposed
+    /// to the daemon's own bookkeeping (`Ping`, `Shutdown`, `Screens`).
+    fn is_action(&self) -> bool {
+        !matches!(self, Self::Ping | Self::Shutdown | Self::Screens)
+    }
+
     fn is_input(&self) -> bool {
         matches!(
             self,
@@ -270,6 +284,11 @@ const DEADLINE_MARGIN: Duration = Duration::from_millis(250);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
 /// Grace period after SIGTERM before SIGKILL.
 const TERM_GRACE: Duration = Duration::from_secs(2);
+/// How long a failed request waits for the portal's `Session::Closed` before
+/// its error is reported as is. The PipeWire stream and the portal calls can
+/// fail a moment before the signal arrives; a failure the signal follows
+/// within this window is the user stopping the session (exit 5).
+const CLOSED_GRACE: Duration = Duration::from_millis(500);
 
 /// What a daemon probe found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -463,6 +482,8 @@ async fn reap_daemon(daemon: &DaemonProcess, answered: bool) -> &'static str {
 /// ready. Errors if a daemon is already active.
 pub async fn start_session_daemon() -> Result<Value> {
     let socket = socket_path()?;
+    // A new Computer Use task: the user shares again (contract v1).
+    stopped::clear();
     match daemon_state().await {
         DaemonState::Up => bail!("a portal session is already active"),
         DaemonState::Starting(pid) => {
@@ -470,7 +491,7 @@ pub async fn start_session_daemon() -> Result<Value> {
             // open). Spawning another would stack a second dialog; wait for
             // this one instead.
             let outcome = wait_until_ready(&socket, || pid_alive(pid)).await;
-            match after_wait(outcome, Spawner::Earlier) {
+            match after_wait(outcome, Spawner::Earlier, stopped::is_set()) {
                 AfterWait::Done(result) => return result,
                 // It was on its way out (e.g. its session was lost and it was
                 // tearing down): the caller asked for a session, so start one.
@@ -490,6 +511,10 @@ pub async fn start_session_daemon() -> Result<Value> {
 /// Spawn a new detached daemon and wait until it is ready.
 async fn spawn_session_daemon(socket: &Path) -> Result<Value> {
     cleanup_stale_socket(socket).await?;
+    // Again here: a daemon that was ending because the user stopped sharing
+    // writes its marker before it gives up the socket, possibly after the
+    // clear at the top of `start_session_daemon`.
+    stopped::clear();
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     // The daemon's stderr goes to a log next to the socket (truncated per
@@ -527,7 +552,7 @@ async fn spawn_session_daemon(socket: &Path) -> Result<Value> {
         child.try_wait().map(|s| s.is_none()).unwrap_or(true)
     })
     .await;
-    match after_wait(outcome, Spawner::ThisCall) {
+    match after_wait(outcome, Spawner::ThisCall, stopped::is_set()) {
         AfterWait::Done(result) => result,
         AfterWait::SpawnFresh => unreachable!("a daemon this call spawned is never respawned"),
     }
@@ -564,11 +589,16 @@ enum AfterWait {
 /// and exits while we wait was ending anyway (session lost, or a
 /// `session-end` racing us); failing then would latch Computer Use down in
 /// the executor although nothing is wrong, so a fresh daemon is spawned.
-fn after_wait(outcome: WaitOutcome, spawner: Spawner) -> AfterWait {
+///
+/// Either daemon exiting with the stopped-by-user marker set (`stopped`) had
+/// its session closed before it answered its first ping: that is exit 5, and
+/// no fresh daemon - it would share the screen again in the same task.
+fn after_wait(outcome: WaitOutcome, spawner: Spawner, stopped: bool) -> AfterWait {
     match (outcome, spawner) {
         (WaitOutcome::Ready, _) => {
             AfterWait::Done(Ok(serde_json::json!({ "ok": true, "session": "daemon" })))
         }
+        (WaitOutcome::Exited, _) if stopped => AfterWait::Done(Err(stopped::error())),
         (WaitOutcome::Exited, Spawner::Earlier) => AfterWait::SpawnFresh,
         (WaitOutcome::Exited, Spawner::ThisCall) => AfterWait::Done(Err(anyhow::anyhow!(
             "session daemon exited before becoming ready (consent dialog declined or \
@@ -637,6 +667,8 @@ pub async fn stop_session_daemon() -> Result<Value> {
         None if answered => "shutdown-requested",
         None => "none",
     };
+    // After the daemon is gone, so a marker it wrote on its way out goes too.
+    stopped::clear();
     Ok(serde_json::json!({
         "ok": true,
         "ended": outcome != "none",
@@ -686,6 +718,7 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
         }
     };
 
+    let closed = session.closed_signal();
     let serve_result = async {
         #[cfg(unix)]
         let mut terminate =
@@ -701,6 +734,10 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
         loop {
             tokio::select! {
                 _ = &mut terminate_fut => break,
+                () = closed.wait() => {
+                    record_stopped_by_user();
+                    break;
+                }
                 accepted = listener.accept() => {
                     // One client's failure must not end the session: the JS
                     // executor kills a bridge subprocess on timeout, and the
@@ -739,6 +776,9 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
                             eprintln!("gnome-portal-bridge: refused a stale input request: {reason}");
                             (respond_err(&anyhow::anyhow!("{reason}")), false)
                         }
+                        None if request.is_action() => {
+                            unless_closed(&closed, handle_request(&mut session, request)).await
+                        }
                         None => handle_request(&mut session, request).await,
                     };
                     // A session that lost its capture path for good ends, so
@@ -746,7 +786,13 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
                     // (Shutdown, or a lost session) gives up the socket and
                     // pidfile BEFORE the reply: a session-start the reply
                     // triggers must find no daemon, not this one dying.
-                    let leaving = should_shutdown || session.is_dead();
+                    let stopped_by_user = !should_shutdown && closed.is_closed();
+                    let leaving = should_shutdown || stopped_by_user || session.is_dead();
+                    if stopped_by_user {
+                        // Before the release: a client that finds no daemon
+                        // must find the marker, not fall back to a session.
+                        record_stopped_by_user();
+                    }
                     if leaving {
                         files.release();
                     }
@@ -762,7 +808,7 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
                         }
                     }
                     if leaving {
-                        if !should_shutdown {
+                        if !should_shutdown && !stopped_by_user {
                             eprintln!("gnome-portal-bridge: the portal session is unusable; exiting");
                         }
                         break;
@@ -783,6 +829,45 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
     // the daemon (and the compositor's screen-sharing indicator) alive.
     let _ = tokio::time::timeout(TEARDOWN_LIMIT, session.shutdown()).await;
     serve_result
+}
+
+/// The portal closed the daemon's session: the user stopped screen sharing
+/// (or the compositor ended the session). Record it for the clients.
+fn record_stopped_by_user() {
+    eprintln!("gnome-portal-bridge: {}; exiting", stopped::MESSAGE);
+    if let Err(error) = stopped::record_at(&stopped::marker_path()) {
+        eprintln!("gnome-portal-bridge: {error:#}");
+    }
+}
+
+/// Run an action unless the portal closes the session first. Closed while it
+/// runs: the action is abandoned (the session is gone, its portal calls and
+/// frame waits can only fail or time out) and the reply is `stopped_by_user`.
+/// A failure the `Closed` signal follows within `CLOSED_GRACE` is reported
+/// the same way; a monitor that is not shared is never caused by it.
+async fn unless_closed(
+    closed: &ClosedSignal,
+    action: impl std::future::Future<Output = (SessionResponse, bool)>,
+) -> (SessionResponse, bool) {
+    let stopped = || (respond_err(&stopped::error()), false);
+    if closed.is_closed() {
+        return stopped();
+    }
+    tokio::select! {
+        biased;
+        () = closed.wait() => stopped(),
+        (response, shutdown) = action => {
+            let may_be_the_stop = !response.ok
+                && response.error_kind.as_deref() != Some(ErrorKind::NotShared.as_wire());
+            if may_be_the_stop
+                && tokio::time::timeout(CLOSED_GRACE, closed.wait()).await.is_ok()
+            {
+                stopped()
+            } else {
+                (response, shutdown)
+            }
+        }
+    }
 }
 
 /// The daemon's socket and pidfile. Released once, and only while they are
@@ -906,11 +991,43 @@ async fn handle_request(
 /// action is a consent dialog per action, and it may share a different
 /// monitor than the daemon's session - a click on the wrong monitor with no
 /// error (claude-desktop-extra #293).
+///
+/// While the stopped-by-user marker exists the action fails with exit 5 and
+/// nothing is contacted - checked again before the ephemeral fallback, since
+/// the daemon writes the marker just before it gives up its socket.
 pub async fn run_action(request: SessionRequest) -> Result<Value> {
-    let socket = socket_path()?;
-    match request_daemon(&socket, &request, request_timeout(&request)).await {
+    run_action_with(
+        &socket_path()?,
+        &stopped::marker_path(),
+        request,
+        run_ephemeral,
+    )
+    .await
+}
+
+async fn run_action_with<F, Fut>(
+    socket: &Path,
+    marker: &Path,
+    request: SessionRequest,
+    ephemeral: F,
+) -> Result<Value>
+where
+    F: FnOnce(SessionRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<Value>>,
+{
+    stopped::gate_at(marker)?;
+    match request_daemon(socket, &request, request_timeout(&request)).await {
+        // A daemon that died mid-request after the user stopped sharing.
+        DaemonReply::Reply(Err(error))
+            if kind_of(&error).is_none() && stopped::is_set_at(marker) =>
+        {
+            Err(stopped::error())
+        }
         DaemonReply::Reply(result) => result,
-        DaemonReply::NotRunning => run_ephemeral(request).await,
+        DaemonReply::NotRunning => {
+            stopped::gate_at(marker)?;
+            ephemeral(request).await
+        }
     }
 }
 
@@ -1146,6 +1263,7 @@ async fn daemon_stream_screens_reply() -> DaemonReply<Vec<Screen>> {
 /// Fallback 2: no daemon - open a short ephemeral session (consent dialog
 /// unless a restore token is accepted).
 async fn ephemeral_stream_screens() -> Result<Vec<Screen>> {
+    stopped::gate()?;
     eprintln!("gnome-portal-bridge: screens derived from an ephemeral portal session");
     let session = LivePortalSession::open()
         .await
@@ -1300,7 +1418,7 @@ pub fn log_path() -> Result<PathBuf> {
 
 /// `${XDG_RUNTIME_DIR:-/tmp}/gnome-portal-bridge` (contract v1): an empty
 /// `XDG_RUNTIME_DIR` counts as unset, as with the shell's `:-`.
-fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
@@ -1519,7 +1637,7 @@ mod tests {
     #[test]
     fn only_an_earlier_daemon_that_exits_is_replaced() {
         // Ours exited: consent declined or the portal failed - an error.
-        match after_wait(WaitOutcome::Exited, Spawner::ThisCall) {
+        match after_wait(WaitOutcome::Exited, Spawner::ThisCall, false) {
             AfterWait::Done(Err(error)) => assert!(
                 error
                     .to_string()
@@ -1530,11 +1648,11 @@ mod tests {
         }
         // One that predates the call was ending anyway: start a fresh one.
         assert!(matches!(
-            after_wait(WaitOutcome::Exited, Spawner::Earlier),
+            after_wait(WaitOutcome::Exited, Spawner::Earlier, false),
             AfterWait::SpawnFresh
         ));
         for spawner in [Spawner::Earlier, Spawner::ThisCall] {
-            match after_wait(WaitOutcome::Ready, spawner) {
+            match after_wait(WaitOutcome::Ready, spawner, false) {
                 AfterWait::Done(Ok(value)) => {
                     assert_eq!(value, serde_json::json!({"ok": true, "session": "daemon"}))
                 }
@@ -1542,9 +1660,31 @@ mod tests {
             }
             // A dialog still open is never a reason for a second daemon.
             assert!(matches!(
-                after_wait(WaitOutcome::TimedOut, spawner),
+                after_wait(WaitOutcome::TimedOut, spawner, false),
                 AfterWait::Done(Err(_))
             ));
+        }
+    }
+
+    #[test]
+    fn a_daemon_closed_before_ready_is_exit_5_and_never_replaced() {
+        for spawner in [Spawner::Earlier, Spawner::ThisCall] {
+            match after_wait(WaitOutcome::Exited, spawner, true) {
+                AfterWait::Done(Err(error)) => {
+                    assert_eq!(kind_of(&error), Some(ErrorKind::StoppedByUser));
+                    assert_eq!(format!("{error:#}"), stopped::MESSAGE);
+                }
+                other => panic!("{spawner:?}: expected exit 5, got {other:?}"),
+            }
+            // The marker does not turn a ready daemon or an open dialog into 5.
+            assert!(matches!(
+                after_wait(WaitOutcome::Ready, spawner, true),
+                AfterWait::Done(Ok(_))
+            ));
+            match after_wait(WaitOutcome::TimedOut, spawner, true) {
+                AfterWait::Done(Err(error)) => assert_eq!(kind_of(&error), None),
+                other => panic!("expected the dialog timeout, got {other:?}"),
+            }
         }
     }
 
@@ -1870,5 +2010,159 @@ mod tests {
         assert!(!daemon.alive());
         assert!(!pid_alive(daemon.pid));
         child.wait().unwrap();
+    }
+
+    // ---- stopped by the user (contract v1, exit 5) ----
+
+    fn move_request() -> SessionRequest {
+        SessionRequest::MovePointer {
+            screen: screen("A", 0, 0, 100, 100),
+            x: 1,
+            y: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_marker_blocks_actions_without_an_ephemeral_session() {
+        let socket = temp_socket("stopped-gate");
+        let marker = socket.with_file_name("stopped-by-user");
+        stopped::record_at(&marker).unwrap();
+        let reached = std::sync::atomic::AtomicBool::new(false);
+        let result = run_action_with(&socket, &marker, move_request(), |_| async {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Value::Null)
+        })
+        .await;
+        let error = result.unwrap_err();
+        assert_eq!(kind_of(&error), Some(ErrorKind::StoppedByUser));
+        assert_eq!(format!("{error:#}"), stopped::MESSAGE);
+        assert!(
+            !reached.load(std::sync::atomic::Ordering::SeqCst),
+            "the ephemeral session path ran"
+        );
+
+        // Without the marker the absent daemon falls back as before.
+        assert!(stopped::clear_at(&marker));
+        let result = run_action_with(&socket, &marker, move_request(), |_| async {
+            reached.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Value::Bool(true))
+        })
+        .await;
+        assert_eq!(result.unwrap(), Value::Bool(true));
+        assert!(reached.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn stopped_marker_turns_a_dropped_daemon_reply_into_exit_5() {
+        // A daemon that accepts and then dies without a reply (generic
+        // transport error) while the marker exists: the user stopped it.
+        let socket = temp_socket("stopped-drop");
+        let marker = socket.with_file_name("stopped-by-user");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server_marker = marker.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            // The marker lands while the request is in flight; no reply.
+            stopped::record_at(&server_marker).unwrap();
+            drop(stream);
+        });
+        let result = run_action_with(&socket, &marker, move_request(), |_| async {
+            panic!("the daemon was there; no ephemeral session")
+        })
+        .await;
+        server.await.unwrap();
+        let error = result.unwrap_err();
+        assert_eq!(kind_of(&error), Some(ErrorKind::StoppedByUser));
+    }
+
+    fn failed(kind: Option<ErrorKind>) -> (SessionResponse, bool) {
+        let error = match kind {
+            Some(kind) => kinded(kind, "failed"),
+            None => anyhow::anyhow!("failed"),
+        };
+        (respond_err(&error), false)
+    }
+
+    fn is_stopped(response: &SessionResponse) -> bool {
+        !response.ok && response.error_kind.as_deref() == Some("stopped_by_user")
+    }
+
+    #[tokio::test]
+    async fn closed_during_an_action_replies_stopped_by_user() {
+        let (tx, closed) = ClosedSignal::manual();
+        let fire = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tx.send_replace(true);
+            tx
+        });
+        let started = Instant::now();
+        let (response, shutdown) = unless_closed(&closed, std::future::pending()).await;
+        assert!(is_stopped(&response), "{response:?}");
+        assert!(!shutdown);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(fire.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn already_closed_never_starts_the_action() {
+        let (tx, closed) = ClosedSignal::manual();
+        tx.send_replace(true);
+        let (response, _) = unless_closed(&closed, async {
+            panic!("the action ran after Closed");
+        })
+        .await;
+        assert!(is_stopped(&response));
+    }
+
+    #[tokio::test]
+    async fn a_failure_followed_by_closed_is_the_stop() {
+        let (tx, closed) = ClosedSignal::manual();
+        // The PipeWire stream (or a portal call) fails a moment before the
+        // D-Bus signal arrives.
+        let fire = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send_replace(true);
+        };
+        let ((response, _), ()) =
+            tokio::join!(unless_closed(&closed, async { failed(None) }), fire);
+        assert!(is_stopped(&response), "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn failures_without_closed_keep_their_error() {
+        let closed = ClosedSignal::never();
+        let (response, _) =
+            unless_closed(&closed, async { failed(Some(ErrorKind::NoSession)) }).await;
+        assert_eq!(response.error_kind.as_deref(), Some("no_session"));
+
+        // With a live subscription that does not fire: the grace passes.
+        let (_tx, closed) = ClosedSignal::manual();
+        let started = Instant::now();
+        let (response, _) = unless_closed(&closed, async { failed(None) }).await;
+        assert!(!is_stopped(&response));
+        assert!(started.elapsed() >= CLOSED_GRACE);
+
+        // Not shared is never the stop, and does not wait for it.
+        let started = Instant::now();
+        let (response, _) =
+            unless_closed(&closed, async { failed(Some(ErrorKind::NotShared)) }).await;
+        assert_eq!(response.error_kind.as_deref(), Some("not_shared"));
+        assert!(started.elapsed() < CLOSED_GRACE);
+
+        // A success is a success.
+        let (response, _) =
+            unless_closed(&closed, async { (respond_ok(Value::Bool(true)), false) }).await;
+        assert!(response.ok);
+    }
+
+    #[test]
+    fn only_portal_requests_race_closed() {
+        assert!(!SessionRequest::Ping.is_action());
+        assert!(!SessionRequest::Shutdown.is_action());
+        assert!(!SessionRequest::Screens.is_action());
+        assert!(move_request().is_action());
+        assert!(SessionRequest::LeftMouseUp.is_action());
     }
 }

@@ -276,3 +276,86 @@ fn bad_usage_exits_2() {
     assert_eq!(code(&sandbox.run(&["bogus-subcommand"])), 2);
     assert_eq!(code(&sandbox.run(&["doctor", "--bogus-flag"])), 2);
 }
+
+impl Sandbox {
+    fn plant_stopped_marker(&self) -> PathBuf {
+        let dir = self.runtime().join(BRIDGE);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("stopped-by-user");
+        std::fs::write(&marker, "1761234567\n").unwrap();
+        marker
+    }
+}
+
+#[test]
+fn stopped_by_user_blocks_input_and_capture_with_exit_5() {
+    let sandbox = Sandbox::new("stopped");
+    let marker = sandbox.plant_stopped_marker();
+
+    let cases: &[&[&str]] = &[
+        &["pointer-move", "--x", "1", "--y", "1"],
+        &["pointer-click", "--x", "1", "--y", "1"],
+        &["key-sequence", "--keys", "ctrl+c"],
+        &["type", "--text", "x"],
+        &["screenshot"],
+        &["zoom", "--x", "0", "--y", "0", "--w", "10", "--h", "10"],
+        &["left-mouse-up"],
+    ];
+    for args in cases {
+        let started = std::time::Instant::now();
+        let output = sandbox.run(args);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(code(&output), 5, "{args:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+        assert!(
+            stderr.contains("screen sharing was stopped (the portal session was closed"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{args:?} took {:?}",
+            started.elapsed()
+        );
+    }
+    // No portal session was attempted (it would create the token store).
+    assert!(!sandbox.state().exists(), "a portal session was attempted");
+    assert!(marker.exists());
+}
+
+#[test]
+fn session_end_and_forget_session_remove_the_stopped_marker() {
+    let sandbox = Sandbox::new("stopped-end");
+    let marker = sandbox.plant_stopped_marker();
+    let result = json(&sandbox.run(&["session-end"]));
+    assert_eq!(result["ended"], false);
+    assert!(!marker.exists(), "session-end left the marker");
+
+    let marker = sandbox.plant_stopped_marker();
+    json(&sandbox.run(&["forget-session"]));
+    assert!(!marker.exists(), "forget-session left the marker");
+    assert!(
+        !sandbox.state().exists(),
+        "forget-session created the state dir"
+    );
+}
+
+#[test]
+fn doctor_reports_stopped_by_user() {
+    let sandbox = Sandbox::new("stopped-doctor");
+    assert_eq!(json(&sandbox.run(&["doctor"]))["stopped_by_user"], false);
+    sandbox.plant_stopped_marker();
+    assert_eq!(json(&sandbox.run(&["doctor"]))["stopped_by_user"], true);
+    json(&sandbox.run(&["session-end"]));
+    assert_eq!(json(&sandbox.run(&["doctor"]))["stopped_by_user"], false);
+}
+
+#[test]
+fn listing_still_works_while_stopped() {
+    let sandbox = Sandbox::new("stopped-listing");
+    sandbox.plant_stopped_marker();
+    // Without a bus these fail as before (exit 1), never with exit 5.
+    for args in [&["screens"][..], &["windows"]] {
+        let output = sandbox.run(args);
+        assert_ne!(code(&output), 5, "{args:?}");
+    }
+}

@@ -112,8 +112,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Stopping screen sharing from GNOME's indicator is detected.** The
+  session daemon watches the portal session's `Closed` signal. When the user
+  stops sharing, it writes `$XDG_RUNTIME_DIR/gnome-portal-bridge/stopped-by-user`,
+  removes its socket and pidfile and exits (measured on GNOME 51: 0.28 s).
+  A request in flight and every later input or capture command exit 5
+  (`error_kind` `stopped_by_user`) instead of failing vaguely, and they no
+  longer fall back to an ephemeral portal session, which with a remembered
+  grant would have restarted sharing without asking. `session-start`,
+  `session-end` and `forget-session` remove the marker; `doctor` reports
+  `stopped_by_user`.
 - **Computer Use bridge CLI contract v1**
-  ([contract]({URL})).
+  ([contract](https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md)).
   `doctor` leads with `contract`, `bridge`, `version`, `backend`,
   `session_match`, `backend_reachable`/`backend_error` (bounded portal and
   Mutter D-Bus checks), `session_supported`, `restore_token_path` (the file;
