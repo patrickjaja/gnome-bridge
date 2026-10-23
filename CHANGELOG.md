@@ -4,6 +4,56 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-10-23
+
+### Fixed
+
+- **`screens` never reached Mutter.** The `GetCurrentState` decoder was one
+  field short of Mutter's `(siiddada{sv})` mode signature (the preferred-scale
+  double), and zbus rejects the whole reply on a signature mismatch, so every
+  call silently fell back to deriving screens from a fresh portal session - a
+  consent dialog per `screens`, and because pointer and capture commands
+  resolve their screen the same way, a dialog per click and per zoom as well,
+  even with the session daemon up. Screens now come from Mutter in
+  milliseconds with the connector name as `id` (`eDP-1`, not `stream-116`); a
+  unit test pins the decoder to Mutter's published signature. The remaining
+  fallbacks (the running daemon's streams, then an ephemeral session) announce
+  themselves on stderr (claude-desktop-extra #293).
+- **No restore token was ever stored.** Persistence of a combined
+  RemoteDesktop + ScreenCast session may only be requested through
+  `RemoteDesktop.SelectDevices`; the portal rejects `persist_mode` on
+  `ScreenCast.SelectSources` for a remote-desktop session, and `lamco-portal`
+  sends it to both. The rejection was being treated as "this GNOME cannot
+  persist" and the session retried without persistence - on every GNOME. The
+  bridge now builds the session itself with `ashpd` (persistence on
+  `SelectDevices` only, RemoteDesktop portal v2+), stores the token the `Start`
+  response returns, and rotates it on every session. Verified on GNOME 48: the
+  second `session-start`, and every one-shot command, runs with no dialog.
+- **`zoom` without `--display` takes global coordinates.** That is what the
+  executor sends when it has no monitor list; the bridge used to apply them to
+  the primary display and refuse the region on any monitor not at the origin.
+  The display under the region's origin is used and the region is clamped to
+  it; only a region entirely outside a display is an error.
+- **`session-end` makes sure the daemon is gone.** The daemon records its pid
+  next to the socket; `session-end` asks it to stop, waits, then sends SIGTERM
+  and SIGKILL. The daemon also bounds its own teardown and hard-exits. A
+  daemon that outlived `session-end` kept the portal session - and GNOME's
+  screen-sharing indicator - alive.
+- **A client that goes away mid-request no longer ends the daemon.** The
+  executor kills a bridge subprocess on timeout; the half-written request that
+  left behind used to error the serve loop and take the whole session down.
+- `session-start` finding a daemon that is still waiting on its consent dialog
+  waits for it instead of spawning a second daemon (and a second dialog), and
+  gives up early when the daemon exits (dialog declined). Liveness probes are
+  bounded, so `doctor`, `session-start` and `session-end` cannot hang behind
+  an open dialog.
+
+### Added
+
+- The detached daemon's stderr is written to
+  `$XDG_RUNTIME_DIR/gnome-portal-bridge/daemon.log` (truncated per start);
+  `doctor` prints the path as `daemon_log`.
+
 ## 2026-07-06
 
 ### Changed

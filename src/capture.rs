@@ -59,9 +59,11 @@ pub fn zoom_result_from_frame(
     }
     let rgb = rgb_from_frame(frame)?;
     let cropped = crop_logical_region(&rgb, screen, x, y, w, h)?;
+    // The crop is already in stream (physical) pixels and may have been
+    // clamped, so size the output from it rather than the requested region.
     encode_resized_jpeg_base64(
         &cropped,
-        compute_target_dims(w as u32, h as u32, screen.scale.unwrap_or(1.0)),
+        compute_target_dims(cropped.width(), cropped.height(), 1.0),
     )
 }
 
@@ -114,17 +116,23 @@ fn crop_logical_region(
     w: i32,
     h: i32,
 ) -> Result<RgbImage> {
-    if x < 0 || y < 0 {
-        bail!("zoom region must start within the display");
-    }
-    if x + w > screen.geometry.width || y + h > screen.geometry.height {
+    // Clamp to the display instead of refusing: callers round a region out of
+    // Electron's logical bounds, and fractional scales make the two sides
+    // disagree by a pixel. Only a region with nothing inside the display is
+    // an error.
+    let x0 = x.max(0);
+    let y0 = y.max(0);
+    let x1 = (x + w).min(screen.geometry.width);
+    let y1 = (y + h).min(screen.geometry.height);
+    if x1 <= x0 || y1 <= y0 {
         bail!(
-            "zoom region {x},{y} {w}x{h} exceeds display `{}` logical bounds {}x{}",
+            "zoom region {x},{y} {w}x{h} lies outside display `{}` logical bounds {}x{}",
             screen.id,
             screen.geometry.width,
             screen.geometry.height,
         );
     }
+    let (x, y, w, h) = (x0, y0, x1 - x0, y1 - y0);
 
     let scale_x = f64::from(rgb.width()) / f64::from(screen.geometry.width.max(1));
     let scale_y = f64::from(rgb.height()) / f64::from(screen.geometry.height.max(1));

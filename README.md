@@ -50,11 +50,16 @@ legacy python path's token file.
 
 ## Consent dialog
 
-The first `session-start` shows the portal's screen-share / remote-control
-consent dialog. On **GNOME 46+** a restore token is persisted under
-`$XDG_STATE_HOME/gnome-portal-bridge/`, so later sessions are **dialog-free**.
-On **GNOME 43-45** (no portal persistence) the dialog appears once per
-`session-start`, which is accepted by design.
+The first session shows the portal's "Remote Desktop" consent dialog; leave
+"Remember This Selection" on and turn on "Allow Remote Interaction". With
+RemoteDesktop portal version 2 (**GNOME 46+**) the grant comes back as a
+restore token, persisted under `$XDG_STATE_HOME/gnome-portal-bridge/`, so every
+later session - daemon or one-shot - is **dialog-free**. `doctor` reports
+`restore_token_present`. On RemoteDesktop v1 (**GNOME <= 45**, no portal
+persistence) the dialog appears once per session, which is accepted by design.
+Persistence is requested through `RemoteDesktop.SelectDevices` only; the portal
+refuses it on `ScreenCast.SelectSources` for a remote-desktop session (see
+DESIGN.md).
 
 ## Usage
 

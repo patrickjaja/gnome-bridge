@@ -43,12 +43,23 @@ type PhysicalMonitor = (
     std::collections::HashMap<String, OwnedValue>, // properties
 );
 
-/// A mode: `(s i i d a d a{sv})` = (id, width, height, refresh, preferred_scales, props)
+/// A mode: `(s i i d d a d a{sv})` = (id, width, height, refresh,
+/// preferred_scale, supported_scales, props).
+///
+/// The shape must match Mutter's wire signature `(siiddada{sv})` EXACTLY:
+/// zbus checks the body signature against this type before decoding, so a
+/// missing field is not a partial read but a hard "signature mismatch" error
+/// for the whole call. The first release of this bridge dropped the
+/// `preferred_scale` double, which made every `GetCurrentState` call fail and
+/// silently pushed `screens` (and every pointer/capture command, which resolve
+/// screens the same way) onto the portal-stream fallback - one consent dialog
+/// per command (claude-desktop-extra issue #293).
 type PhysicalMode = (
     String,                                        // mode id
     i32,                                           // width (physical pixels)
     i32,                                           // height (physical pixels)
     f64,                                           // refresh (Hz)
+    f64,                                           // preferred scale
     Vec<f64>,                                      // supported scales
     std::collections::HashMap<String, OwnedValue>, // properties (contains "is-current")
 );
@@ -137,13 +148,13 @@ fn connector_current_mode(
         if c != connector {
             continue;
         }
-        for (_id, width, height, refresh, _scales, props) in modes {
+        for (_id, width, height, refresh, _preferred, _scales, props) in modes {
             if mode_is_current(props) {
                 return (*width, *height, Some(*refresh));
             }
         }
         // No mode flagged current: use the first as a best effort.
-        if let Some((_id, width, height, refresh, _s, _p)) = modes.first() {
+        if let Some((_id, width, height, refresh, _pref, _s, _p)) = modes.first() {
             return (*width, *height, Some(*refresh));
         }
     }
@@ -162,7 +173,19 @@ fn mode_is_current(props: &std::collections::HashMap<String, OwnedValue>) -> boo
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use zbus::zvariant::Value;
+    use zbus::zvariant::{Type, Value};
+
+    /// Pin the decoder shape to Mutter's published `GetCurrentState` signature
+    /// (`data/dbus-interfaces/org.gnome.Mutter.DisplayConfig.xml`). zbus
+    /// refuses to decode a reply whose body signature differs from this, so a
+    /// drift here is a total loss of the Mutter path, not a field mismatch.
+    #[test]
+    fn reply_type_matches_mutter_wire_signature() {
+        assert_eq!(
+            GetCurrentStateReply::SIGNATURE.to_string(),
+            "(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})"
+        );
+    }
 
     fn ident(name: &str) -> (String, String, String, String) {
         (
@@ -184,6 +207,7 @@ mod tests {
             width,
             height,
             refresh,
+            1.0,
             vec![1.0, 2.0],
             props,
         )

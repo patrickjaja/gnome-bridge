@@ -48,6 +48,11 @@ pub enum SessionRequest {
     Ping,
     /// Stop the daemon.
     Shutdown,
+    /// The screens the daemon's portal session covers (derived from its
+    /// ScreenCast streams). Lets the Mutter-less fallback reuse the live
+    /// session instead of opening a second portal session (= a second
+    /// consent dialog) while the daemon is up.
+    Screens,
     MovePointer {
         screen: Screen,
         x: i32,
@@ -111,15 +116,50 @@ struct SessionResponse {
     error: Option<String>,
 }
 
-/// Whether a session daemon is currently reachable.
-pub async fn daemon_running() -> bool {
+/// How long a liveness probe may wait for the daemon's reply. The daemon
+/// binds its socket BEFORE the portal session is up, so while the consent
+/// dialog is open a connect succeeds but no reply ever comes; without a bound
+/// every `doctor` / `session-start` / `session-end` would hang on it.
+const PING_TIMEOUT: Duration = Duration::from_secs(3);
+/// Grace period after a Shutdown reply before the daemon is signalled.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(3);
+/// Grace period after SIGTERM before SIGKILL.
+const TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// What a daemon probe found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonState {
+    /// No daemon: no socket, or a socket nobody answers on and no live pid.
+    Down,
+    /// A daemon process exists but does not answer yet (consent dialog open,
+    /// or busy with a long request).
+    Starting(i32),
+    /// The daemon answers.
+    Up,
+}
+
+/// Probe the daemon: socket reachable and answering, else a live pid from the
+/// pidfile, else down.
+pub async fn daemon_state() -> DaemonState {
     let Ok(socket) = socket_path() else {
-        return false;
+        return DaemonState::Down;
     };
-    if !socket.exists() {
-        return false;
+    if socket.exists()
+        && tokio::time::timeout(PING_TIMEOUT, ping(&socket))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    {
+        return DaemonState::Up;
     }
-    ping(&socket).await.is_ok()
+    match live_daemon_pid() {
+        Some(pid) => DaemonState::Starting(pid),
+        None => DaemonState::Down,
+    }
+}
+
+/// Whether a session daemon is currently reachable (answers a ping).
+pub async fn daemon_running() -> bool {
+    daemon_state().await == DaemonState::Up
 }
 
 async fn ping(socket: &Path) -> Result<()> {
@@ -127,16 +167,84 @@ async fn ping(socket: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The pid recorded by a running `serve-session`, if that process is still
+/// alive AND still a `gnome-portal-bridge serve-session` (pids get reused).
+fn live_daemon_pid() -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(pid_path().ok()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    if pid <= 1 {
+        return None;
+    }
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    if !cmdline.windows(13).any(|w| w == b"serve-session") {
+        return None;
+    }
+    Some(pid)
+}
+
+fn pid_alive(pid: i32) -> bool {
+    // SAFETY: kill(pid, 0) only probes for existence/permission.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Wait up to `grace` for `pid` to exit; true when it did.
+async fn wait_for_exit(pid: i32, grace: Duration) -> bool {
+    let deadline = Instant::now() + grace;
+    while Instant::now() < deadline {
+        if !pid_alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    !pid_alive(pid)
+}
+
+/// Make sure a daemon process is gone: Shutdown reply or not, after the grace
+/// period it gets SIGTERM, then SIGKILL. Returns the signal that was needed.
+/// A `session-end` that leaves `serve-session` behind also leaves the GNOME
+/// screen-sharing indicator on (the portal session stays open), so this is
+/// not optional cleanup (claude-desktop-extra issue #293).
+async fn reap_daemon(pid: i32) -> &'static str {
+    if wait_for_exit(pid, SHUTDOWN_GRACE).await {
+        return "exited";
+    }
+    // SAFETY: plain signal delivery to a pid we verified is our daemon.
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    if wait_for_exit(pid, TERM_GRACE).await {
+        return "sigterm";
+    }
+    // SAFETY: as above.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    wait_for_exit(pid, Duration::from_secs(1)).await;
+    "sigkill"
+}
+
 /// Start a detached daemon holding a live portal session, waiting until it is
 /// ready. Errors if a daemon is already active.
 pub async fn start_session_daemon() -> Result<Value> {
-    if daemon_running().await {
-        bail!("a portal session is already active");
-    }
     let socket = socket_path()?;
+    match daemon_state().await {
+        DaemonState::Up => bail!("a portal session is already active"),
+        DaemonState::Starting(pid) => {
+            // A daemon is already coming up (its consent dialog is probably
+            // open). Spawning another would stack a second dialog; wait for
+            // this one instead.
+            return wait_until_ready(&socket, || pid_alive(pid)).await;
+        }
+        DaemonState::Down => {}
+    }
     cleanup_stale_socket(&socket).await?;
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    // The daemon's stderr goes to a log next to the socket (truncated per
+    // start) so a portal or PipeWire failure inside the session can be read
+    // after the fact; nothing else ever sees that stream.
+    let log = std::fs::File::create(log_path()?)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null());
     let mut command = Command::new(current_exe);
     command
         .arg("serve-session")
@@ -144,7 +252,7 @@ pub async fn start_session_daemon() -> Result<Value> {
         .arg(&socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(log);
 
     #[cfg(unix)]
     unsafe {
@@ -156,12 +264,28 @@ pub async fn start_session_daemon() -> Result<Value> {
         });
     }
 
-    command.spawn().context("failed to spawn session daemon")?;
+    let mut child = command.spawn().context("failed to spawn session daemon")?;
+    // `try_wait` rather than kill(pid, 0): an exited-but-unreaped child is a
+    // zombie, which still "exists" to kill(2).
+    wait_until_ready(&socket, || {
+        child.try_wait().map(|s| s.is_none()).unwrap_or(true)
+    })
+    .await
+}
 
+/// Poll the socket until the daemon answers. Gives up early when the daemon
+/// process dies (consent declined -> `serve_session` exits), else after 30 s.
+async fn wait_until_ready(socket: &Path, mut alive: impl FnMut() -> bool) -> Result<Value> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if ping(&socket).await.is_ok() {
+        if tokio::time::timeout(PING_TIMEOUT, ping(socket))
+            .await
+            .is_ok_and(|r| r.is_ok())
+        {
             return Ok(serde_json::json!({ "ok": true, "session": "daemon" }));
+        }
+        if !alive() {
+            bail!("session daemon exited before becoming ready (consent dialog declined?)");
         }
         if Instant::now() >= deadline {
             bail!(
@@ -172,15 +296,28 @@ pub async fn start_session_daemon() -> Result<Value> {
     }
 }
 
-/// Stop the daemon if one is running (idempotent).
+/// Stop the daemon if one is running (idempotent). Asks it to shut down over
+/// the socket, then makes sure the process is actually gone.
 pub async fn stop_session_daemon() -> Result<Value> {
     let socket = socket_path()?;
-    if !socket.exists() {
-        return Ok(serde_json::json!({ "ok": true, "ended": true }));
+    let pid = live_daemon_pid();
+    if socket.exists() {
+        // Best-effort: a missing/dead daemon is still "ended". Bounded, so a
+        // daemon stuck behind its consent dialog cannot hang us.
+        let _ = tokio::time::timeout(PING_TIMEOUT, async {
+            let _: Result<Value> = send(&socket, &SessionRequest::Shutdown).await;
+        })
+        .await;
     }
-    // Best-effort: a missing/dead daemon is still "ended".
-    let _: Result<Value> = send(&socket, &SessionRequest::Shutdown).await;
-    Ok(serde_json::json!({ "ok": true, "ended": true }))
+    let mut ended = serde_json::json!({ "ok": true, "ended": true });
+    if let Some(pid) = pid {
+        ended["daemon"] = Value::String(reap_daemon(pid).await.to_owned());
+        std::fs::remove_file(&socket).ok();
+        if let Ok(pidfile) = pid_path() {
+            std::fs::remove_file(pidfile).ok();
+        }
+    }
+    Ok(ended)
 }
 
 /// Run the daemon: bind the socket, open the portal session, serve requests
@@ -200,11 +337,15 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
 
     let listener = UnixListener::bind(&socket)
         .with_context(|| format!("failed to bind session socket `{}`", socket.display()))?;
+    let pidfile = pid_path()?;
+    std::fs::write(&pidfile, std::process::id().to_string())
+        .with_context(|| format!("failed to write pidfile `{}`", pidfile.display()))?;
 
     let mut session = match LivePortalSession::open().await {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_file(&socket).ok();
+            std::fs::remove_file(&pidfile).ok();
             return Err(error);
         }
     };
@@ -225,10 +366,28 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
             tokio::select! {
                 _ = &mut terminate_fut => break,
                 accepted = listener.accept() => {
-                    let (mut stream, _) = accepted.context("failed to accept IPC client")?;
-                    let request = read_request(&mut stream).await?;
+                    // One client's failure must not end the session: the JS
+                    // executor kills a bridge subprocess on timeout, and the
+                    // half-written request that leaves behind used to take the
+                    // whole daemon down with it (claude-desktop-extra #293).
+                    let (mut stream, _) = match accepted {
+                        Ok(accepted) => accepted,
+                        Err(error) => {
+                            eprintln!("gnome-portal-bridge: accept failed: {error:#}");
+                            continue;
+                        }
+                    };
+                    let request = match read_request(&mut stream).await {
+                        Ok(request) => request,
+                        Err(error) => {
+                            eprintln!("gnome-portal-bridge: dropped a client request: {error:#}");
+                            continue;
+                        }
+                    };
                     let (response, should_shutdown) = handle_request(&mut session, request).await;
-                    write_response(&mut stream, response).await?;
+                    if let Err(error) = write_response(&mut stream, response).await {
+                        eprintln!("gnome-portal-bridge: client went away before the reply: {error:#}");
+                    }
                     if should_shutdown {
                         break;
                     }
@@ -239,8 +398,11 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
     }
     .await;
 
-    session.shutdown().await.ok();
+    // Bounded: a portal/PipeWire teardown that never completes must not keep
+    // the daemon (and the compositor's screen-sharing indicator) alive.
+    let _ = tokio::time::timeout(Duration::from_secs(5), session.shutdown()).await;
     std::fs::remove_file(&socket).ok();
+    std::fs::remove_file(&pidfile).ok();
     serve_result
 }
 
@@ -253,6 +415,7 @@ async fn handle_request(
         SessionRequest::Shutdown => {
             return (respond_ok(serde_json::json!({ "ok": true })), true);
         }
+        SessionRequest::Screens => respond(Ok(session.screens_from_streams())),
         SessionRequest::MovePointer { screen, x, y } => {
             respond(session.move_pointer(&screen, x, y).await)
         }
@@ -350,14 +513,33 @@ pub async fn resolve_screen(display: Option<&str>) -> Result<Screen> {
 /// List screens the same way the top-level `screens` command does: Mutter first,
 /// portal-stream fallback.
 pub async fn list_screens_best_effort() -> Result<Vec<Screen>> {
-    if let Ok(connection) = zbus::Connection::session().await
-        && let Ok(screens) = screens::list_screens(&connection).await
+    match zbus::Connection::session().await {
+        Ok(connection) => match screens::list_screens(&connection).await {
+            Ok(screens) if !screens.is_empty() => return Ok(screens),
+            Ok(_) => eprintln!("gnome-portal-bridge: Mutter DisplayConfig reported no monitors"),
+            Err(error) => {
+                eprintln!("gnome-portal-bridge: Mutter DisplayConfig unavailable: {error:#}")
+            }
+        },
+        Err(error) => eprintln!("gnome-portal-bridge: no session bus: {error:#}"),
+    }
+    // Fallback 1: the running daemon already holds a portal session - ask it
+    // for its streams instead of opening (and prompting for) a second one.
+    let socket = socket_path()?;
+    if socket.exists()
+        && let Ok(Ok(screens)) = tokio::time::timeout(
+            PING_TIMEOUT,
+            send::<Vec<Screen>>(&socket, &SessionRequest::Screens),
+        )
+        .await
         && !screens.is_empty()
     {
+        eprintln!("gnome-portal-bridge: screens derived from the running portal session's streams");
         return Ok(screens);
     }
-    // Fallback: derive from the portal streams. If a daemon is up we cannot
-    // cheaply query it for streams, so open a short ephemeral session.
+    // Fallback 2: no daemon - open a short ephemeral session (consent dialog
+    // unless a restore token is accepted).
+    eprintln!("gnome-portal-bridge: screens derived from an ephemeral portal session");
     let session = LivePortalSession::open()
         .await
         .context("failed to open portal session for screen enumeration")?;
@@ -459,10 +641,27 @@ async fn cleanup_stale_socket(socket: &Path) -> Result<()> {
 }
 
 pub fn socket_path() -> Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    Ok(runtime_dir().join("session.sock"))
+}
+
+/// The daemon's pidfile, next to the socket.
+pub fn pid_path() -> Result<PathBuf> {
+    Ok(runtime_dir().join("session.pid"))
+}
+
+/// The detached daemon's stderr log, next to the socket.
+pub fn log_path() -> Result<PathBuf> {
+    let dir = runtime_dir();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create `{}`", dir.display()))?;
+    Ok(dir.join("daemon.log"))
+}
+
+fn runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
-    Ok(base.join("gnome-portal-bridge").join("session.sock"))
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("gnome-portal-bridge")
 }
 
 fn respond_ok(value: Value) -> SessionResponse {

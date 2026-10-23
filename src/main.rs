@@ -91,7 +91,17 @@ async fn run() -> Result<()> {
             w,
             h,
         } => {
-            let screen = resolve_screen(display.as_deref()).await?;
+            // With `--display` the region is display-relative (the x11/kwin
+            // contract). Without it the caller only has GLOBAL coordinates
+            // (the JS falls back to that when it has no monitor list), so
+            // resolve the screen under the region's origin and translate.
+            let (screen, x, y) = match display.as_deref() {
+                Some(selector) => (resolve_screen(Some(selector)).await?, x, y),
+                None => {
+                    let screen = resolve_screen_for_point(x, y).await?;
+                    (screen.clone(), x - screen.geometry.x, y - screen.geometry.y)
+                }
+            };
             let value = run_action(SessionRequest::Zoom { screen, x, y, w, h }).await?;
             print_json(&value)?;
         }
@@ -178,7 +188,8 @@ async fn run() -> Result<()> {
                 // Run the daemon in the foreground (blocks until SIGTERM). The
                 // socket is prepared here so a subsequent connect works.
                 let socket = daemon::socket_path()?;
-                serve_session(socket).await?;
+                let result = serve_session(socket).await;
+                exit_after_serve(result);
             } else {
                 print_json(&start_session_daemon().await?)?;
             }
@@ -187,11 +198,26 @@ async fn run() -> Result<()> {
             print_json(&stop_session_daemon().await?)?;
         }
         Command::ServeSession { socket } => {
-            serve_session(std::path::PathBuf::from(socket)).await?;
+            let result = serve_session(std::path::PathBuf::from(socket)).await;
+            exit_after_serve(result);
         }
     }
 
     Ok(())
+}
+
+/// The daemon must never outlive its session: a PipeWire or portal thread that
+/// refuses to wind down would otherwise keep the process (and the compositor's
+/// screen-sharing indicator) alive after `session-end`. Hard-exit instead of
+/// relying on the runtime teardown.
+fn exit_after_serve(result: Result<()>) -> ! {
+    match result {
+        Ok(()) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("{error:#}");
+            std::process::exit(1)
+        }
+    }
 }
 
 /// Resolve the screen containing a global point, else the default screen. Point

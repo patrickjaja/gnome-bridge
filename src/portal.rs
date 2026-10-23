@@ -11,11 +11,13 @@
 //! + logical size) against the stream's reported size - the same idea as the
 //!   kwin bridge's `local_stream_point`.
 //!
-//! Session persistence: on GNOME 46+ the portal returns a restore token which
-//! we persist under `$XDG_STATE_HOME/gnome-portal-bridge/`, so subsequent
-//! `session-start` calls reuse the grant with no consent dialog. On GNOME 43-45
-//! there is no persistence, so a dialog appears once per `session-start`
-//! (accepted by design).
+//! Session persistence: with RemoteDesktop portal v2 (GNOME 46+) the portal
+//! returns a restore token which we persist under
+//! `$XDG_STATE_HOME/gnome-portal-bridge/`, so subsequent sessions reuse the
+//! grant with no consent dialog. Persistence is requested through
+//! RemoteDesktop.SelectDevices ONLY - see the session-setup section below for
+//! why. On RemoteDesktop v1 (GNOME <= 45) there is no persistence, so a dialog
+//! appears once per session (accepted by design).
 
 use std::collections::HashSet;
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
@@ -24,7 +26,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use ashpd::desktop::PersistMode;
-use ashpd::desktop::screencast::CursorMode;
+use ashpd::desktop::remote_desktop::{
+    DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
+};
+use ashpd::desktop::screencast::{
+    CursorMode, Screencast, SelectSourcesOptions, SourceType as SourceTypeFlag,
+};
 use lamco_pipewire::{
     PipeWireThreadCommand, PipeWireThreadManager, PixelFormat, StreamConfig, VideoFrame,
 };
@@ -506,55 +513,190 @@ fn resolve_key_spec(spec: &str) -> Result<Vec<u32>> {
 }
 
 // ---- portal session setup ----
+//
+// The session is built here with ashpd directly instead of through
+// `PortalManager::create_session`, because of how persistence works for a
+// COMBINED RemoteDesktop + ScreenCast session (xdg-desktop-portal docs,
+// ScreenCast.SelectSources): "Setting persist_mode is only allowed for screen
+// cast sessions. Persistent remote desktop screen cast sessions can only be
+// handled via the Remote Desktop interface." lamco-portal passes persist_mode +
+// restore_token to BOTH SelectDevices and SelectSources, the portal rejects the
+// SelectSources call with InvalidArgument, and the only way to get a session at
+// all was to retry with persistence off - which is why no restore token was
+// ever stored and a consent dialog appeared on every session
+// (claude-desktop-extra issue #293). The correct flow: persist_mode and the
+// saved token go to RemoteDesktop.SelectDevices ONLY (RemoteDesktop portal
+// version >= 2, i.e. GNOME 46+), SelectSources carries no persistence options,
+// and the new token comes back in RemoteDesktop.Start's response.
+//
+// `PortalManager` is still used for the input path (`remote_desktop()` holds
+// the proxy the `notify_*` calls go through); only session creation is ours.
 
 async fn start_session() -> Result<(PortalManager, PortalSessionHandle, Option<String>)> {
     let token_store = TokenStore::new()?;
     let saved_token = token_store.load().unwrap_or(None);
 
-    match try_start_session(saved_token.clone(), true).await {
-        Ok((manager, session, restore_token)) => {
+    let config = default_config();
+    let manager = PortalManager::new(config.clone())
+        .await
+        .context("failed to connect to the XDG desktop portal")?;
+    let remote_desktop = RemoteDesktop::new()
+        .await
+        .context("failed to open the RemoteDesktop portal proxy")?;
+    let persistence = if remote_desktop.version() >= 2 {
+        Persistence::Requested
+    } else {
+        // RemoteDesktop portal v1 (GNOME <= 45): no persistence API at all; a
+        // consent dialog per session is the best that backend can do.
+        Persistence::Unsupported
+    };
+
+    match try_start_session(&remote_desktop, &config, saved_token.clone(), persistence).await {
+        Ok((session, restore_token)) => {
             if let Some(ref token) = restore_token {
                 token_store.save(token).ok();
             }
             Ok((manager, session, restore_token))
         }
-        Err(error) if is_persistence_rejection(&error) => {
-            // GNOME 43-45 (or a backend rejecting persistence): retry with no
-            // persistence. A consent dialog appears; this is by design.
-            let (manager, session, restore_token) = try_start_session(None, false)
-                .await
-                .context("failed to create session after persistence fallback")?;
-            if let Some(ref token) = restore_token {
-                token_store.save(token).ok();
-            }
+        Err(error) if persistence == Persistence::Requested && is_persistence_rejection(&error) => {
+            // A backend that advertises v2 but refuses to persist (or a token
+            // it no longer accepts): one more try with no persistence at all
+            // so the session still comes up; the dialog is unavoidable then.
+            eprintln!(
+                "gnome-portal-bridge: portal rejected a persistent session ({error:#}); \
+                 retrying without persistence (a consent dialog will appear each session)"
+            );
+            let (session, restore_token) =
+                try_start_session(&remote_desktop, &config, None, Persistence::Unsupported)
+                    .await
+                    .context("failed to create session after persistence fallback")?;
             Ok((manager, session, restore_token))
         }
         Err(error) => Err(error),
     }
 }
 
-async fn try_start_session(
-    restore_token: Option<String>,
-    with_persistence: bool,
-) -> Result<(PortalManager, PortalSessionHandle, Option<String>)> {
-    let manager = PortalManager::new(default_config(restore_token, with_persistence)).await?;
-    let session_id = generate_session_id()?;
-    let (session, restore_token) = manager
-        .create_session(session_id, None)
-        .await
-        .context("failed to create combined RemoteDesktop/ScreenCast portal session")?;
-    Ok((manager, session, restore_token))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Persistence {
+    /// Ask the portal to remember the grant (RemoteDesktop portal v2+).
+    Requested,
+    /// Do not ask; the backend cannot persist remote desktop sessions.
+    Unsupported,
 }
 
-fn default_config(restore_token: Option<String>, with_persistence: bool) -> PortalConfig {
+async fn try_start_session(
+    remote_desktop: &RemoteDesktop,
+    config: &PortalConfig,
+    restore_token: Option<String>,
+    persistence: Persistence,
+) -> Result<(PortalSessionHandle, Option<String>)> {
+    let session = remote_desktop
+        .create_session(Default::default())
+        .await
+        .context("failed to create the RemoteDesktop portal session")?;
+
+    let result =
+        select_and_start(remote_desktop, config, &session, restore_token, persistence).await;
+    match result {
+        Ok((fd, streams, token)) => {
+            let session_id = generate_session_id()?;
+            let handle = PortalSessionHandle::new(
+                session_id.clone(),
+                fd.into_raw_fd(),
+                streams,
+                Some(session_id),
+                session,
+            );
+            Ok((handle, token))
+        }
+        Err(error) => {
+            // Close the half-built session so the portal does not keep stale
+            // state around (a retry on the same connection would otherwise
+            // fail with "Invalid state").
+            session.close().await.ok();
+            Err(error)
+        }
+    }
+}
+
+async fn select_and_start(
+    remote_desktop: &RemoteDesktop,
+    config: &PortalConfig,
+    session: &ashpd::desktop::Session<RemoteDesktop>,
+    restore_token: Option<String>,
+    persistence: Persistence,
+) -> Result<(OwnedFd, Vec<lamco_portal::StreamInfo>, Option<String>)> {
+    let mut devices = SelectDevicesOptions::default().set_devices(config.devices);
+    if persistence == Persistence::Requested {
+        devices = devices
+            .set_persist_mode(PersistMode::ExplicitlyRevoked)
+            .set_restore_token(restore_token.as_deref());
+    }
+    remote_desktop
+        .select_devices(session, devices)
+        .await
+        .context("RemoteDesktop.SelectDevices failed")?
+        .response()
+        .context("RemoteDesktop.SelectDevices was refused")?;
+
+    // No persist_mode / restore_token here, by portal contract (see above).
+    let screencast = Screencast::new()
+        .await
+        .context("failed to open the ScreenCast portal proxy")?;
+    let sources = SelectSourcesOptions::default()
+        .set_cursor_mode(config.cursor_mode)
+        .set_sources(config.source_type)
+        .set_multiple(config.allow_multiple);
+    screencast
+        .select_sources(session, sources)
+        .await
+        .context("ScreenCast.SelectSources failed")?
+        .response()
+        .context("ScreenCast.SelectSources was refused")?;
+
+    // Start: shows the consent dialog unless the restore token is accepted.
+    let selected = remote_desktop
+        .start(session, None, StartOptions::default())
+        .await
+        .context("RemoteDesktop.Start failed")?
+        .response()
+        .context("RemoteDesktop.Start was refused (consent dialog declined or closed?)")?;
+    let restore_token = selected.restore_token().map(str::to_owned);
+
+    let streams: Vec<lamco_portal::StreamInfo> = selected
+        .streams()
+        .iter()
+        .map(|stream| {
+            let size = stream.size().unwrap_or((0, 0));
+            lamco_portal::StreamInfo {
+                node_id: stream.pipe_wire_node_id(),
+                position: stream.position().unwrap_or((0, 0)),
+                size: (
+                    size.0.max(0).try_into().unwrap_or(0),
+                    size.1.max(0).try_into().unwrap_or(0),
+                ),
+                source_type: SourceType::Monitor,
+            }
+        })
+        .collect();
+    if streams.is_empty() {
+        bail!("the portal session started with no screen streams");
+    }
+
+    let fd = screencast
+        .open_pipe_wire_remote(session, Default::default())
+        .await
+        .context("ScreenCast.OpenPipeWireRemote failed")?;
+
+    Ok((fd, streams, restore_token))
+}
+
+fn default_config() -> PortalConfig {
     PortalConfig {
         cursor_mode: CursorMode::Embedded,
-        restore_token,
-        persist_mode: if with_persistence {
-            PersistMode::ExplicitlyRevoked
-        } else {
-            PersistMode::DoNot
-        },
+        source_type: SourceTypeFlag::Monitor.into(),
+        devices: DeviceType::Keyboard | DeviceType::Pointer,
+        allow_multiple: true,
         ..Default::default()
     }
 }
@@ -569,7 +711,7 @@ fn generate_session_id() -> Result<String> {
 
 fn is_persistence_rejection(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
-    message.contains("cannot persist") || message.contains("InvalidArgument")
+    message.contains("persist") || message.contains("InvalidArgument")
 }
 
 // ---- PipeWire helpers ----

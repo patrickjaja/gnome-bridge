@@ -40,10 +40,17 @@ Expect one entry per monitor with `geometry`, a `scale` (fractional allowed),
 "$BIN" session-start
 ```
 
-On the **first** run GNOME shows a screen-share / remote-control consent dialog.
-Accept it. Expect `{"ok":true,"session":"daemon"}`. On GNOME 46+ a restore token
-is now saved (`doctor` -> `restore_token_present: true`); re-running
-`session-start` after `session-end` should NOT prompt again.
+On the **first** run GNOME shows the "Remote Desktop" consent dialog: keep
+"Remember This Selection" on, turn on "Allow Remote Interaction", Share. Expect
+`{"ok":true,"session":"daemon"}`. On GNOME 46+ a restore token is now saved
+(`doctor` -> `restore_token_present: true`); re-running `session-start` after
+`session-end` must NOT prompt again, and neither must a one-shot command with
+no daemon running. The client gives up after 30 s, but the daemon keeps waiting
+for the dialog: a later `session-start` attaches to it.
+
+Also check that `screens` above returned a connector name (`eDP-1`), not
+`stream-<n>`: a `stream-` id means the Mutter path failed and the portal
+fallback (one consent dialog per command) is in use - see stderr.
 
 ## 3. Screenshot
 
@@ -98,9 +105,12 @@ re-run, then unset it.
 ## 7. End the session
 
 ```sh
-"$BIN" session-end     # -> {"ok":true,"ended":true}
+"$BIN" session-end     # -> {"ok":true,"ended":true,"daemon":"exited"}
 "$BIN" doctor          # daemon_running should be false again
+pgrep -af serve-session   # must print nothing; the screen-share indicator is gone
 ```
+
+The daemon's stderr is in `$XDG_RUNTIME_DIR/gnome-portal-bridge/daemon.log`.
 
 ## Not supported on GNOME (should error cleanly, exit 1)
 

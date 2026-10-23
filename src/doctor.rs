@@ -23,6 +23,8 @@ pub struct DoctorReport {
     pub restore_token_present: bool,
     pub restore_token_dir: String,
     pub daemon_running: bool,
+    /// Where a detached daemon's stderr lands.
+    pub daemon_log: String,
 }
 
 /// Read a `u` property from an interface on the desktop portal.
@@ -111,5 +113,8 @@ pub async fn doctor() -> DoctorReport {
         restore_token_present,
         restore_token_dir,
         daemon_running: daemon::daemon_running().await,
+        daemon_log: daemon::log_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_owned()),
     }
 }
