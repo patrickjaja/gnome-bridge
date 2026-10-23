@@ -63,7 +63,7 @@ DESIGN.md).
 
 Select **all monitors** in the dialog. A monitor that was not shared is not
 silently replaced by another one: pointer and capture commands on it fail with
-`monitor <id> ... is not shared in the portal session`, and while a session
+`monitor <id> ... is not shared in the portal session` (exit 3), and while a session
 daemon runs, `screens` reports `"is_shared": false` for it. To change the
 selection, run `gnome-portal-bridge forget-session` (ends the session and
 deletes the stored restore token; a plain `session-end` would replay the same
@@ -85,8 +85,20 @@ gnome-portal-bridge session-end
 ```
 
 Every subcommand is short-lived and prints one JSON object/array on stdout.
-Without a running daemon, one-shot commands open an ephemeral portal session,
+Without a running daemon, capture and input commands open an ephemeral portal session,
 act, and tear down. See [DESIGN.md](DESIGN.md) for the full CLI/JSON contract.
+
+## CLI contract v1
+
+The bridge implements the
+[Computer Use bridge CLI contract v1](https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md)
+shared by every claude-desktop-extra bridge: `doctor` starts with the contract
+keys (`contract`, `bridge`, `version`, `backend`, `session_match`,
+`backend_reachable`, `restore_token_path`, `session_socket`, ...) and never
+opens a portal session; errors exit 1, bad usage 2, a monitor that is not
+shared 3, no live portal session 4; `session-end` / `forget-session` report
+`ended` and `daemon`. `tests/contract.rs` checks it. Details in
+[DESIGN.md](DESIGN.md#cli-contract-v1).
 
 ## Binary resolution (for the JS executor)
 

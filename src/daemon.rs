@@ -36,6 +36,7 @@ use std::os::unix::process::CommandExt;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
+use crate::error_kind::{ErrorKind, kind_of, kinded};
 use crate::input::Button;
 use crate::output::Screen;
 use crate::portal::LivePortalSession;
@@ -216,6 +217,26 @@ struct SessionResponse {
     result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The failure's `ErrorKind` wire name (`not_shared`, `no_session`), so
+    /// the client exits with the contract code without parsing `error`.
+    /// Absent from older daemons and on generic failures: exit 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_kind: Option<String>,
+}
+
+impl SessionResponse {
+    /// The client-side error for a failed (`ok: false`) response: the
+    /// daemon's text verbatim, classified by its `error_kind` when this
+    /// binary knows the kind.
+    fn into_error(self) -> anyhow::Error {
+        let message = self
+            .error
+            .unwrap_or_else(|| "session IPC request failed".to_owned());
+        match self.error_kind.as_deref().and_then(ErrorKind::from_wire) {
+            Some(kind) => kinded(kind, message),
+            None => anyhow::anyhow!("{message}"),
+        }
+    }
 }
 
 /// How long a liveness probe may wait for the daemon's reply. The daemon
@@ -448,16 +469,35 @@ pub async fn start_session_daemon() -> Result<Value> {
             // A daemon is already coming up (its consent dialog is probably
             // open). Spawning another would stack a second dialog; wait for
             // this one instead.
-            return wait_until_ready(&socket, || pid_alive(pid)).await;
+            let outcome = wait_until_ready(&socket, || pid_alive(pid)).await;
+            match after_wait(outcome, Spawner::Earlier) {
+                AfterWait::Done(result) => return result,
+                // It was on its way out (e.g. its session was lost and it was
+                // tearing down): the caller asked for a session, so start one.
+                AfterWait::SpawnFresh => {
+                    eprintln!(
+                        "gnome-portal-bridge: the session daemon {pid} exited while starting; \
+                         spawning a new one"
+                    );
+                }
+            }
         }
         DaemonState::Down => {}
     }
-    cleanup_stale_socket(&socket).await?;
+    spawn_session_daemon(&socket).await
+}
+
+/// Spawn a new detached daemon and wait until it is ready.
+async fn spawn_session_daemon(socket: &Path) -> Result<Value> {
+    cleanup_stale_socket(socket).await?;
 
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     // The daemon's stderr goes to a log next to the socket (truncated per
     // start) so a portal or PipeWire failure inside the session can be read
     // after the fact; nothing else ever sees that stream.
+    let log_dir = runtime_dir();
+    std::fs::create_dir_all(&log_dir)
+        .with_context(|| format!("failed to create `{}`", log_dir.display()))?;
     let log = std::fs::File::create(log_path()?)
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
@@ -465,7 +505,7 @@ pub async fn start_session_daemon() -> Result<Value> {
     command
         .arg("serve-session")
         .arg("--socket")
-        .arg(&socket)
+        .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(log);
@@ -483,39 +523,85 @@ pub async fn start_session_daemon() -> Result<Value> {
     let mut child = command.spawn().context("failed to spawn session daemon")?;
     // `try_wait` rather than kill(pid, 0): an exited-but-unreaped child is a
     // zombie, which still "exists" to kill(2).
-    wait_until_ready(&socket, || {
+    let outcome = wait_until_ready(socket, || {
         child.try_wait().map(|s| s.is_none()).unwrap_or(true)
     })
-    .await
+    .await;
+    match after_wait(outcome, Spawner::ThisCall) {
+        AfterWait::Done(result) => result,
+        AfterWait::SpawnFresh => unreachable!("a daemon this call spawned is never respawned"),
+    }
+}
+
+/// How waiting for a daemon to become ready ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    Ready,
+    /// The daemon process went away before it answered.
+    Exited,
+    /// Still not answering after `READY_TIMEOUT` (consent dialog open).
+    TimedOut,
+}
+
+/// Who started the daemon `session-start` waited on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spawner {
+    /// It existed before this `session-start`.
+    Earlier,
+    /// This `session-start` spawned it.
+    ThisCall,
+}
+
+/// What `session-start` does next.
+#[derive(Debug)]
+enum AfterWait {
+    Done(Result<Value>),
+    SpawnFresh,
+}
+
+/// A daemon this call spawned that exits means the consent dialog was
+/// declined or the portal failed: an error. A daemon that predates the call
+/// and exits while we wait was ending anyway (session lost, or a
+/// `session-end` racing us); failing then would latch Computer Use down in
+/// the executor although nothing is wrong, so a fresh daemon is spawned.
+fn after_wait(outcome: WaitOutcome, spawner: Spawner) -> AfterWait {
+    match (outcome, spawner) {
+        (WaitOutcome::Ready, _) => {
+            AfterWait::Done(Ok(serde_json::json!({ "ok": true, "session": "daemon" })))
+        }
+        (WaitOutcome::Exited, Spawner::Earlier) => AfterWait::SpawnFresh,
+        (WaitOutcome::Exited, Spawner::ThisCall) => AfterWait::Done(Err(anyhow::anyhow!(
+            "session daemon exited before becoming ready (consent dialog declined or \
+             closed, or the portal failed){}",
+            log_hint()
+        ))),
+        (WaitOutcome::TimedOut, _) => AfterWait::Done(Err(anyhow::anyhow!(
+            "still waiting for the portal consent dialog after {}s; the session daemon \
+             keeps waiting - answer the dialog, then run session-start again{}",
+            READY_TIMEOUT.as_secs(),
+            log_hint()
+        ))),
+    }
 }
 
 /// Poll the socket until the daemon answers. Gives up early when the daemon
 /// process dies (consent declined -> `serve_session` exits), else after
 /// `READY_TIMEOUT`, leaving the daemon to wait on: a later `session-start`
 /// picks it up instead of opening a second dialog.
-async fn wait_until_ready(socket: &Path, mut alive: impl FnMut() -> bool) -> Result<Value> {
+async fn wait_until_ready(socket: &Path, mut alive: impl FnMut() -> bool) -> WaitOutcome {
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
         if tokio::time::timeout(PING_TIMEOUT, ping(socket))
             .await
             .is_ok_and(|r| r.is_ok())
         {
-            return Ok(serde_json::json!({ "ok": true, "session": "daemon" }));
+            return WaitOutcome::Ready;
         }
         if !alive() {
-            bail!(
-                "session daemon exited before becoming ready (consent dialog declined or \
-                 closed, or the portal failed){}",
-                log_hint()
-            );
+            return WaitOutcome::Exited;
         }
         if Instant::now() >= deadline {
-            bail!(
-                "still waiting for the portal consent dialog after {}s; the session daemon \
-                 keeps waiting - answer the dialog, then run session-start again{}",
-                READY_TIMEOUT.as_secs(),
-                log_hint()
-            );
+            return WaitOutcome::TimedOut;
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
@@ -534,26 +620,37 @@ pub async fn stop_session_daemon() -> Result<Value> {
                 .await,
             DaemonReply::Reply(Ok(_))
         );
-    let mut ended = serde_json::json!({ "ok": true, "ended": true });
-    if let Some(daemon) = daemon {
-        ended["daemon"] = Value::String(reap_daemon(&daemon, answered).await.to_owned());
-        // A daemon that had to be killed left its files behind.
-        std::fs::remove_file(&socket).ok();
-        if read_pidfile() == Some(daemon.pid)
-            && let Ok(pidfile) = pid_path()
-        {
-            std::fs::remove_file(pidfile).ok();
+    // Contract v1: `ended` only when a daemon was actually there (a process,
+    // or at least something that answered the Shutdown request).
+    let outcome = match daemon {
+        Some(daemon) => {
+            let outcome = reap_daemon(&daemon, answered).await;
+            // A daemon that had to be killed left its files behind.
+            std::fs::remove_file(&socket).ok();
+            if read_pidfile() == Some(daemon.pid)
+                && let Ok(pidfile) = pid_path()
+            {
+                std::fs::remove_file(pidfile).ok();
+            }
+            outcome
         }
-    }
-    Ok(ended)
+        None if answered => "shutdown-requested",
+        None => "none",
+    };
+    Ok(serde_json::json!({
+        "ok": true,
+        "ended": outcome != "none",
+        "daemon": outcome,
+    }))
 }
 
 /// `forget-session`: end any running daemon, then delete the restore token.
 /// Without this, `session-end` + `session-start` silently replays the stored
-/// grant - the same monitor selection - so "re-share" changes nothing.
+/// grant - the same monitor selection - so "re-share" changes nothing. Never
+/// creates a directory and never calls D-Bus (contract v1).
 pub async fn forget_session() -> Result<Value> {
+    let store = crate::token_store::TokenStore::locate()?;
     let mut result = stop_session_daemon().await?;
-    let store = crate::token_store::TokenStore::new()?;
     result["token_removed"] = Value::Bool(store.remove()?);
     result["token_path"] = Value::String(store.path().display().to_string());
     Ok(result)
@@ -579,12 +676,12 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
     let pidfile = pid_path()?;
     std::fs::write(&pidfile, std::process::id().to_string())
         .with_context(|| format!("failed to write pidfile `{}`", pidfile.display()))?;
+    let mut files = DaemonFiles::new(socket.clone(), pidfile);
 
     let mut session = match LivePortalSession::open().await {
         Ok(session) => session,
         Err(error) => {
-            std::fs::remove_file(&socket).ok();
-            std::fs::remove_file(&pidfile).ok();
+            files.release();
             return Err(error);
         }
     };
@@ -644,6 +741,15 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
                         }
                         None => handle_request(&mut session, request).await,
                     };
+                    // A session that lost its capture path for good ends, so
+                    // the next session-start opens a fresh one. Leaving
+                    // (Shutdown, or a lost session) gives up the socket and
+                    // pidfile BEFORE the reply: a session-start the reply
+                    // triggers must find no daemon, not this one dying.
+                    let leaving = should_shutdown || session.is_dead();
+                    if leaving {
+                        files.release();
+                    }
                     let written = tokio::time::timeout(IPC_IO_TIMEOUT, write_response(&mut stream, response)).await;
                     match written {
                         Ok(Ok(())) => {}
@@ -655,13 +761,10 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
                             eprintln!("gnome-portal-bridge: a client timed out reading the reply");
                         }
                     }
-                    if should_shutdown {
-                        break;
-                    }
-                    // A session that lost its capture path for good ends, so
-                    // the next session-start opens a fresh one.
-                    if session.is_dead() {
-                        eprintln!("gnome-portal-bridge: the portal session is unusable; exiting");
+                    if leaving {
+                        if !should_shutdown {
+                            eprintln!("gnome-portal-bridge: the portal session is unusable; exiting");
+                        }
                         break;
                     }
                 }
@@ -671,12 +774,59 @@ pub async fn serve_session(socket: PathBuf) -> Result<()> {
     }
     .await;
 
+    // Gone from the socket path before the (up to TEARDOWN_LIMIT) teardown,
+    // so a session-start meanwhile spawns a new daemon instead of waiting on
+    // this one (SIGTERM and errors reach here without the release above).
+    drop(listener);
+    files.release();
     // Bounded: a portal/PipeWire teardown that never completes must not keep
     // the daemon (and the compositor's screen-sharing indicator) alive.
     let _ = tokio::time::timeout(TEARDOWN_LIMIT, session.shutdown()).await;
-    std::fs::remove_file(&socket).ok();
-    std::fs::remove_file(&pidfile).ok();
     serve_result
+}
+
+/// The daemon's socket and pidfile. Released once, and only while they are
+/// still this daemon's: after the release a new daemon may already own both
+/// paths, so a late removal would orphan it.
+struct DaemonFiles {
+    socket: PathBuf,
+    /// (device, inode) of the socket this daemon bound.
+    socket_id: Option<(u64, u64)>,
+    pidfile: PathBuf,
+    released: bool,
+}
+
+impl DaemonFiles {
+    fn new(socket: PathBuf, pidfile: PathBuf) -> Self {
+        let socket_id = file_id(&socket);
+        Self {
+            socket,
+            socket_id,
+            pidfile,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if std::mem::replace(&mut self.released, true) {
+            return;
+        }
+        if self.socket_id.is_some() && file_id(&self.socket) == self.socket_id {
+            std::fs::remove_file(&self.socket).ok();
+        }
+        let ours = std::fs::read_to_string(&self.pidfile)
+            .is_ok_and(|pid| pid.trim() == std::process::id().to_string());
+        if ours {
+            std::fs::remove_file(&self.pidfile).ok();
+        }
+    }
+}
+
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| (meta.dev(), meta.ino()))
 }
 
 async fn handle_request(
@@ -865,10 +1015,7 @@ async fn run_ephemeral(request: SessionRequest) -> Result<Value> {
     if response.ok {
         Ok(response.result.unwrap_or(Value::Null))
     } else {
-        bail!(
-            "{}",
-            response.error.unwrap_or_else(|| "action failed".to_owned())
-        )
+        Err(response.into_error())
     }
 }
 
@@ -880,9 +1027,20 @@ pub async fn resolve_screen(display: Option<&str>) -> Result<Screen> {
         Some(_) => list_screens_best_effort().await?,
         // The default screen should be one the daemon can act on, so ask
         // which monitors its session shares (see `pick_screen`).
-        None => list_screens_with_sharing().await?,
+        None => list_screens_with_sharing(Ephemeral::Allowed).await?,
     };
     pick_screen(&screens, display)
+}
+
+/// Whether a screen listing may open an ephemeral portal session when
+/// neither Mutter nor a daemon can answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ephemeral {
+    /// Pointer/capture commands, which open a session anyway.
+    Allowed,
+    /// The `screens` command: contract v1 says it never opens a portal
+    /// session (nor shows a consent dialog).
+    Refused,
 }
 
 /// List screens for pointer/capture commands: Mutter first, portal-stream
@@ -891,12 +1049,12 @@ pub async fn list_screens_best_effort() -> Result<Vec<Screen>> {
     if let Some(screens) = mutter_screens().await {
         return Ok(screens);
     }
-    Ok(stream_screens_without_mutter().await?.0)
+    Ok(stream_screens_without_mutter(Ephemeral::Allowed).await?.0)
 }
 
 /// Screens when Mutter is unavailable, and whether they came from a running
 /// daemon (true) or an ephemeral session (false).
-async fn stream_screens_without_mutter() -> Result<(Vec<Screen>, bool)> {
+async fn stream_screens_without_mutter(ephemeral: Ephemeral) -> Result<(Vec<Screen>, bool)> {
     // Fallback 1: the running daemon already holds a portal session - ask it
     // for its streams instead of opening (and prompting for) a second one.
     // A daemon that is there but fails is an error, not a reason for a
@@ -910,6 +1068,10 @@ async fn stream_screens_without_mutter() -> Result<(Vec<Screen>, bool)> {
         }
         DaemonReply::Reply(Ok(_)) => bail!("the session daemon reported no screens"),
         DaemonReply::Reply(Err(error)) => Err(error),
+        DaemonReply::NotRunning if ephemeral == Ephemeral::Refused => bail!(
+            "Mutter DisplayConfig unavailable and no session running; cannot list monitors \
+             without opening a portal session"
+        ),
         DaemonReply::NotRunning => Ok((ephemeral_stream_screens().await?, false)),
     }
 }
@@ -917,15 +1079,18 @@ async fn stream_screens_without_mutter() -> Result<(Vec<Screen>, bool)> {
 /// The `screens` command: like `list_screens_best_effort`, plus `is_shared`
 /// on every screen while a session daemon answers - true iff the daemon's
 /// portal session has a stream at that screen's origin. Without a daemon the
-/// field is omitted (asking would need a portal session of its own).
-pub async fn list_screens_with_sharing() -> Result<Vec<Screen>> {
+/// field is omitted (asking would need a portal session of its own). With
+/// neither Mutter nor a daemon, `Ephemeral::Refused` (the `screens` command)
+/// fails instead of opening an ephemeral session; the default-screen lookup
+/// of capture commands passes `Allowed`.
+pub async fn list_screens_with_sharing(ephemeral: Ephemeral) -> Result<Vec<Screen>> {
     if let Some(mut screens) = mutter_screens().await {
         if let Some(streams) = daemon_stream_screens().await {
             mark_shared(&mut screens, &streams);
         }
         return Ok(screens);
     }
-    let (mut screens, from_daemon) = stream_screens_without_mutter().await?;
+    let (mut screens, from_daemon) = stream_screens_without_mutter(ephemeral).await?;
     // Without Mutter, a daemon's screens ARE its streams; an ephemeral
     // session's are not "shared" in the daemon sense, so leave them unset.
     if from_daemon {
@@ -1074,12 +1239,7 @@ async fn exchange<T: DeserializeOwned>(
     })?;
 
     if !response.ok {
-        bail!(
-            "{}",
-            response
-                .error
-                .unwrap_or_else(|| "session IPC request failed".to_owned())
-        );
+        return Err(response.into_error());
     }
     let value = response.result.unwrap_or(Value::Null);
     serde_json::from_value(value).context("failed to decode session IPC payload")
@@ -1132,16 +1292,17 @@ pub fn pid_path() -> Result<PathBuf> {
     Ok(runtime_dir().join("session.pid"))
 }
 
-/// The detached daemon's stderr log, next to the socket.
+/// The detached daemon's stderr log, next to the socket. Only the path:
+/// `session-start` creates the directory, `doctor` and error hints must not.
 pub fn log_path() -> Result<PathBuf> {
-    let dir = runtime_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("failed to create `{}`", dir.display()))?;
-    Ok(dir.join("daemon.log"))
+    Ok(runtime_dir().join("daemon.log"))
 }
 
+/// `${XDG_RUNTIME_DIR:-/tmp}/gnome-portal-bridge` (contract v1): an empty
+/// `XDG_RUNTIME_DIR` counts as unset, as with the shell's `:-`.
 fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
+        .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("gnome-portal-bridge")
@@ -1152,6 +1313,7 @@ fn respond_ok(value: Value) -> SessionResponse {
         ok: true,
         result: Some(value),
         error: None,
+        error_kind: None,
     }
 }
 
@@ -1160,6 +1322,7 @@ fn respond_err(error: &anyhow::Error) -> SessionResponse {
         ok: false,
         result: None,
         error: Some(format!("{error:#}")),
+        error_kind: kind_of(error).map(|kind| kind.as_wire().to_owned()),
     }
 }
 
@@ -1171,6 +1334,7 @@ fn respond<T: Serialize>(result: Result<T>) -> SessionResponse {
                 ok: false,
                 result: None,
                 error: Some(format!("failed to serialize response: {error}")),
+                error_kind: None,
             },
         },
         Err(error) => respond_err(&error),
@@ -1283,6 +1447,54 @@ mod tests {
         std::fs::remove_dir_all(socket.parent().unwrap()).ok();
     }
 
+    /// Serve one connection with raw reply bytes, as any daemon version might.
+    async fn reply_once(tag: &str, reply: Vec<u8>) -> anyhow::Error {
+        let socket = temp_socket(tag);
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let _ = read_request(&mut stream).await.unwrap();
+            stream.write_all(&reply).await.unwrap();
+        });
+        let reply: DaemonReply<Value> =
+            request_daemon(&socket, &SessionRequest::Ping, Duration::from_secs(2)).await;
+        server.await.unwrap();
+        std::fs::remove_dir_all(socket.parent().unwrap()).ok();
+        match reply {
+            DaemonReply::Reply(Err(error)) => error,
+            _ => panic!("expected the daemon's error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn error_kind_crosses_the_socket() {
+        for kind in [ErrorKind::NotShared, ErrorKind::NoSession] {
+            let response = respond_err(&kinded(kind, "the daemon's text").context("outer"));
+            assert_eq!(response.error_kind.as_deref(), Some(kind.as_wire()));
+            let error = reply_once("kind", serde_json::to_vec(&response).unwrap()).await;
+            assert_eq!(kind_of(&error), Some(kind));
+            assert_eq!(error.to_string(), "outer: the daemon's text");
+        }
+        // Generic failures carry no kind on the wire at all.
+        let bytes = serde_json::to_vec(&respond_err(&anyhow::anyhow!("plain"))).unwrap();
+        assert!(!String::from_utf8(bytes).unwrap().contains("error_kind"));
+    }
+
+    #[tokio::test]
+    async fn an_old_or_newer_daemon_reply_is_a_generic_failure() {
+        // A daemon from before contract v1 (still running after an upgrade):
+        // no `error_kind`, the not-shared text with its old remedy tail.
+        let old = br#"{"ok":false,"error":"monitor eDP-1 (0,0 1920x1080) is not shared in the portal session (shared: HDMI-1 at 1920,0 2560x1440); run `gnome-portal-bridge forget-session`, then start Computer Use again and select all monitors in the dialog"}"#;
+        let error = reply_once("old", old.to_vec()).await;
+        assert_eq!(kind_of(&error), None);
+        assert!(error.to_string().starts_with("monitor eDP-1"));
+        // A kind this binary does not know.
+        let newer = br#"{"ok":false,"error":"x","error_kind":"from_the_future"}"#;
+        let error = reply_once("newer", newer.to_vec()).await;
+        assert_eq!(kind_of(&error), None);
+        assert_eq!(error.to_string(), "x");
+    }
+
     #[test]
     fn request_timeout_covers_sleeps_and_stays_under_the_js_budget() {
         assert!(request_timeout(&SessionRequest::LeftMouseUp) < Duration::from_secs(30));
@@ -1297,14 +1509,70 @@ mod tests {
     #[tokio::test]
     async fn ready_wait_reports_a_dead_daemon_as_exited() {
         let socket = temp_socket("ready");
-        let error = wait_until_ready(&socket, || false).await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .starts_with("session daemon exited before becoming ready"),
-            "{error}"
+        assert_eq!(
+            wait_until_ready(&socket, || false).await,
+            WaitOutcome::Exited
         );
         std::fs::remove_dir_all(socket.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn only_an_earlier_daemon_that_exits_is_replaced() {
+        // Ours exited: consent declined or the portal failed - an error.
+        match after_wait(WaitOutcome::Exited, Spawner::ThisCall) {
+            AfterWait::Done(Err(error)) => assert!(
+                error
+                    .to_string()
+                    .starts_with("session daemon exited before becoming ready"),
+                "{error}"
+            ),
+            other => panic!("expected an error, got {other:?}"),
+        }
+        // One that predates the call was ending anyway: start a fresh one.
+        assert!(matches!(
+            after_wait(WaitOutcome::Exited, Spawner::Earlier),
+            AfterWait::SpawnFresh
+        ));
+        for spawner in [Spawner::Earlier, Spawner::ThisCall] {
+            match after_wait(WaitOutcome::Ready, spawner) {
+                AfterWait::Done(Ok(value)) => {
+                    assert_eq!(value, serde_json::json!({"ok": true, "session": "daemon"}))
+                }
+                other => panic!("expected ready, got {other:?}"),
+            }
+            // A dialog still open is never a reason for a second daemon.
+            assert!(matches!(
+                after_wait(WaitOutcome::TimedOut, spawner),
+                AfterWait::Done(Err(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn released_files_are_removed_only_while_still_ours() {
+        let socket = temp_socket("files");
+        let dir = socket.parent().unwrap().to_path_buf();
+        let pidfile = dir.join("session.pid");
+
+        // Ours: both go.
+        let listener = UnixListener::bind(&socket).unwrap();
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let mut files = DaemonFiles::new(socket.clone(), pidfile.clone());
+        files.release();
+        assert!(!socket.exists() && !pidfile.exists());
+        drop(listener);
+
+        // A new daemon took both paths before our (late) release: both stay.
+        let _ours = UnixListener::bind(&socket).unwrap();
+        std::fs::write(&pidfile, std::process::id().to_string()).unwrap();
+        let mut files = DaemonFiles::new(socket.clone(), pidfile.clone());
+        std::fs::remove_file(&socket).unwrap();
+        let _theirs = UnixListener::bind(&socket).unwrap();
+        std::fs::write(&pidfile, "999999").unwrap();
+        files.release();
+        assert!(socket.exists());
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), "999999");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

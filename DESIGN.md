@@ -18,7 +18,8 @@ all three interchangeably.
   `X11_BRIDGE_BIN` / `globalThis.__cuX11BridgeBin`. (JS wiring is a separate
   workstream.)
 - **Output:** exactly one JSON object/array on stdout. Errors: a human message on
-  stderr and **exit code 1**. clap parse errors exit 2.
+  stderr and **exit code 1** (3: monitor not shared, 4: no live portal
+  session, see [CLI contract v1](#cli-contract-v1)). clap parse errors exit 2.
 
 ## Engine
 
@@ -95,7 +96,14 @@ still coming up (its consent dialog open) waits for that one instead of
 spawning a second daemon and a second dialog. `session-start` waits up to
 120 s for a human to answer the dialog; on timeout the daemon keeps waiting
 and the error says so (`still waiting for the portal consent dialog`), while
-a daemon that died says `exited before becoming ready`.
+a daemon that died says `exited before becoming ready`. That error is only
+for a daemon this `session-start` spawned (consent declined, portal failed):
+a daemon that already existed and exits while being waited on was ending
+anyway (its session was lost, or a `session-end` raced), so `session-start`
+spawns a fresh one instead. A leaving daemon (Shutdown, lost session,
+SIGTERM) removes its socket and pidfile before its reply and before the
+teardown, and only while they are still its own (socket inode, pid in the
+pidfile), so a `session-start` right after an exit 4 never waits on it.
 
 If no daemon is running, a one-shot subcommand falls back to an **ephemeral**
 session: open a portal session (dialog-free when a restore token exists), do the
@@ -199,9 +207,9 @@ https://github.com/flatpak/xdg-desktop-portal/issues/1976.
 The target screen is the one whose geometry contains the point (else the default
 screen). Its stream is the one whose `position` equals the screen's origin.
 There is **no fallback to another stream**: a monitor that was not shared in
-the consent dialog fails with `monitor <id> (<x>,<y> <w>x<h>) is not shared in
-the portal session (shared: ...); run gnome-portal-bridge forget-session, then
-start Computer Use again and select all monitors in the dialog`. A plain
+the consent dialog fails with exit 3 and `monitor <id> (<x>,<y> <w>x<h>) is not
+shared in the portal session (shared: <id> at <x>,<y> <w>x<h>, ...)`; the
+remedy is the caller's to add. A plain
 `session-end` + `session-start` would replay the stored restore token, i.e.
 the same monitor selection; `forget-session` ends the daemon and deletes the
 token so the next session shows the dialog. The one exception is a single-head setup (exactly one stream and
@@ -221,7 +229,7 @@ screens/windows are snake_case.
 
 | Subcommand | Output shape |
 |---|---|
-| `doctor` | `{xdg_current_desktop, xdg_session_type, portal_present, remote_desktop_version, screen_cast_version, gnome_shell_version, introspect_available, restore_token_present, restore_token_dir, daemon_running}` (human-facing; not parsed by JS) |
+| `doctor` | contract v1 keys `{contract:1, bridge, version, backend:"gnome-portal", session_match, backend_reachable, backend_error, session_supported:true, restore_token_present, restore_token_path, daemon_running, session_socket}`, then extras `{xdg_current_desktop, xdg_session_type, portal_present, remote_desktop_version, screen_cast_version, mutter_present, gnome_shell_version, introspect_available, restore_token_dir (deprecated), daemon_log}` |
 | `screens` | `[{id, name, geometry:{x,y,width,height}, scale, refresh_millihz, is_active, is_primary, is_shared?}]`; `is_shared` is present only while a session daemon answers: true iff the daemon's portal session has a stream at that screen's origin (not read by JS) |
 | `screenshot [--display <id>]` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY}` (camelCase) |
 | `zoom [--display <id>] --x --y --w --h` | `{base64, width, height}`; with `--display` the region is display-relative, without it the region is in GLOBAL coordinates and the display under its origin is used; the region is clamped to the display |
@@ -239,8 +247,8 @@ screens/windows are snake_case.
 | `type --text <t> [--delay-ms N]` | `{action, text, charCount}` |
 | `hold-key --key <k>... --duration-ms N` | `{action, keys, durationMs}` |
 | `session-start [--foreground]` | `{ok:true, session:"daemon"}` |
-| `session-end` | `{ok:true, ended:true}` |
-| `forget-session` | `{ok:true, ended:true, token_removed, token_path}`: ends any daemon and deletes the restore token, so the next session shows the consent dialog (to pick other monitors) |
+| `session-end` | `{ok:true, ended, daemon}`: `ended` only when a daemon was there; `daemon` is `exited`, `sigterm`, `sigkill`, `shutdown-requested` or `none` |
+| `forget-session` | `{ok:true, ended, daemon, token_removed, token_path}`: ends any daemon and deletes the restore token, so the next session shows the consent dialog (to pick other monitors); creates no directory, calls no D-Bus |
 
 The scroll axis convention matches x11-bridge: **positive `dy` scrolls down**.
 Drag interpolates ~20 steps at ~8ms each.
@@ -255,6 +263,36 @@ a monitor the user did not share); without a daemon, or when nothing is
 shared, the active/primary screen, else the first. An explicit `--display` is
 always honored (and errors if that monitor is not shared).
 
+## CLI contract v1
+
+This bridge implements the Computer Use bridge CLI contract v1
+(https://github.com/patrickjaja/claude-desktop-extra/blob/master/docs/computer-use-bridge-contract.md), the interface claude-desktop-extra's launcher and executors use for
+every bridge:
+
+- `doctor` leads with the contract keys (table above) and exits 0 even when
+  the session bus is unreachable. `session_match` is the executor's own GNOME
+  Wayland test (`XDG_SESSION_TYPE=wayland` or `WAYLAND_DISPLAY`, and
+  `XDG_CURRENT_DESKTOP` containing `GNOME`); `backend_reachable` means the
+  session bus, the desktop portal (a RemoteDesktop/ScreenCast `version`
+  property read) and Mutter's DisplayConfig (`Peer.Ping`) answered, each probe
+  bounded to 1.5 s. It never opens a portal session and creates nothing.
+- Exit codes: 0 ok, 1 runtime error, 2 bad usage, 3 the monitor is not shared
+  in the live portal session, 4 no live portal session (the message contains
+  `no active portal session`). The kind is attached where the error starts
+  (`src/error_kind.rs`) and crosses the daemon socket as `error_kind`
+  (`not_shared`, `no_session`) next to the error text, so the client never
+  parses text. A reply without `error_kind` (a daemon from before the upgrade
+  still running) or with an unknown kind exits 1.
+- Files: restore token `${XDG_STATE_HOME:-$HOME/.local/state}/gnome-portal-bridge/restore-token.json`,
+  session socket `${XDG_RUNTIME_DIR:-/tmp}/gnome-portal-bridge/session.sock`
+  (an empty variable counts as unset).
+- `tests/contract.rs` checks the contract against the built binary in a clean
+  environment.
+
+Not covered by exit 4: with no daemon at all, action commands still fall back
+to an ephemeral portal session (see "Daemon vs ephemeral"), and a portal
+session the user stopped from the GNOME panel is not detected as such.
+
 ## Screens & windows
 
 - **Screens** come from `org.gnome.Mutter.DisplayConfig.GetCurrentState` (a public
@@ -264,9 +302,12 @@ always honored (and errors if that monitor is not shared).
   signature by a unit test: zbus refuses the whole reply on any mismatch, which
   does not look like a wrong field but like "DisplayConfig unavailable".
   Fallbacks when DisplayConfig really is unavailable, in order: the running
-  session daemon's ScreenCast streams (no new portal session), else a short
-  ephemeral portal session (`id`/`name` = `stream-<node>`). Every fallback is
-  announced on stderr.
+  session daemon's ScreenCast streams (no new portal session), else, for
+  capture and pointer commands only, a short ephemeral portal session
+  (`id`/`name` = `stream-<node>`). The `screens` command never opens a portal
+  session (contract v1): without Mutter and without a daemon it exits 1
+  (`cannot list monitors without opening a portal session`). Every fallback
+  is announced on stderr.
 - **Windows** come from `org.gnome.Shell.Introspect.GetWindows`. This API is
   **allowlist-restricted**: it works only when the caller is whitelisted or
   `org.gnome.mutter unsafe-mode` is on. When restricted it returns an error, and

@@ -22,17 +22,23 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
+    /// The store, creating its directory (for saving a new token).
     pub fn new() -> Result<Self> {
-        let dir = state_dir()?;
-        fs::create_dir_all(&dir).context("failed to create token store directory")?;
-        Ok(Self {
-            path: dir.join("restore-token.json"),
-        })
+        let store = Self::locate()?;
+        if let Some(dir) = store.path.parent() {
+            fs::create_dir_all(dir).context("failed to create token store directory")?;
+        }
+        Ok(store)
     }
 
-    /// The directory the restore token lives in; also reported by `doctor`.
-    pub fn dir() -> Result<PathBuf> {
-        state_dir()
+    /// The store at its contract path
+    /// (`${XDG_STATE_HOME:-$HOME/.local/state}/gnome-portal-bridge/restore-token.json`),
+    /// without touching the filesystem: `doctor` and `forget-session` must
+    /// not create state directories.
+    pub fn locate() -> Result<Self> {
+        Ok(Self {
+            path: state_dir()?.join("restore-token.json"),
+        })
     }
 
     pub fn exists(&self) -> bool {
@@ -74,10 +80,17 @@ impl TokenStore {
     }
 }
 
+/// `${XDG_STATE_HOME:-$HOME/.local/state}/gnome-portal-bridge`: an empty
+/// `XDG_STATE_HOME` counts as unset, as with the shell's `:-`.
 fn state_dir() -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME is not set")?;
-    let base = std::env::var("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(home).join(".local/state"));
+    let base = match std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
+        Some(base) => PathBuf::from(base),
+        None => {
+            let home = std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .context("HOME is not set")?;
+            PathBuf::from(home).join(".local/state")
+        }
+    };
     Ok(base.join("gnome-portal-bridge"))
 }

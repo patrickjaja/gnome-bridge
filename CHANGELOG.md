@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`session-start` right after a lost session failed.** A daemon whose
+  session was lost kept its socket and pidfile through its teardown (up to
+  1.8 s), so the next `session-start` waited on the dying daemon and failed
+  with `exited before becoming ready`. A leaving daemon now gives up both
+  files before its reply and its teardown (only while they are still its
+  own), and `session-start` spawns a fresh daemon when one that predates the
+  call exits while it waits.
 - **Clicks landed off-target on scaled monitors.** `NotifyPointerMotionAbsolute`
   takes stream VIDEO pixels, but the bridge sent logical offsets, so on a
   1.3333-scaled panel a click aimed at (900,800) landed at (675,660). Points
@@ -105,6 +112,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Computer Use bridge CLI contract v1**
+  ([contract]({URL})).
+  `doctor` leads with `contract`, `bridge`, `version`, `backend`,
+  `session_match`, `backend_reachable`/`backend_error` (bounded portal and
+  Mutter D-Bus checks), `session_supported`, `restore_token_path` (the file;
+  `restore_token_dir` stays one release), `daemon_running` and
+  `session_socket`, and no longer creates directories. A monitor that is not
+  shared exits 3 (the text drops the `forget-session` remedy; consumers add
+  their own), no live portal session exits 4 (`no active portal session`);
+  the kind crosses the daemon socket as `error_kind`, and a reply without it
+  (an older daemon) exits 1. `session-end` reports `ended` only when a daemon
+  was there, always with `daemon` (`none` when nothing ran); `forget-session`
+  adds `token_removed`/`token_path` without creating the state directory.
+  An empty `XDG_STATE_HOME` / `XDG_RUNTIME_DIR` counts as unset. `screens`
+  never opens a portal session: without Mutter and without a daemon it exits
+  1 instead of showing a consent dialog.
+  `tests/contract.rs` checks the CLI in a clean environment.
 - The detached daemon's stderr is written to
   `$XDG_RUNTIME_DIR/gnome-portal-bridge/daemon.log` (truncated per start);
   `doctor` prints the path as `daemon_log`.

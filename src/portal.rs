@@ -51,6 +51,7 @@ use lamco_pipewire::{PipeWireThreadCommand, PixelFormat, StreamConfig, VideoFram
 use lamco_portal::{PortalConfig, PortalManager, PortalSessionHandle, SourceType};
 
 use crate::capture;
+use crate::error_kind::{ErrorKind, kinded};
 use crate::frames::FrameSource;
 use crate::input::keymap::{self, char_to_keysym, keysym_for_name, parse_spec};
 use crate::input::{
@@ -664,7 +665,7 @@ impl LivePortalSession {
 
     async fn ensure_stream(&mut self, node_id: u32, width: u32, height: u32) -> Result<()> {
         if let Some(reason) = &self.dead {
-            bail!("{reason}");
+            return Err(kinded(ErrorKind::NoSession, reason.clone()));
         }
         // A source whose PipeWire thread died never delivers again. Its fd
         // cannot be reused (a dup shares the old connection, whose objects
@@ -684,13 +685,15 @@ impl LivePortalSession {
                 match self.open_pipewire_remote().await {
                     Ok(fd) => fd,
                     Err(error) => {
+                        // Contract v1 exit 4: the message names "no active
+                        // portal session" for consumers below contract 1.
                         let reason = format!(
-                            "the screen capture connection was lost and the portal session \
-                             could not reopen it ({error:#}); the session daemon ends now - \
-                             run session-start again"
+                            "no active portal session: the screen capture connection was lost \
+                             and the portal session could not reopen it ({error:#}); the session \
+                             daemon ends now - run session-start again"
                         );
                         self.dead = Some(reason.clone());
-                        bail!("{reason}");
+                        return Err(kinded(ErrorKind::NoSession, reason));
                     }
                 }
             } else {
@@ -788,17 +791,17 @@ fn select_stream<'a>(
         })
         .collect::<Vec<_>>()
         .join(", ");
+    // Contract v1 wording (exit 3). The remedy is the consumer's to add: the
+    // user of claude-desktop-extra resets the grant through the launcher, not
+    // through this binary.
     let g = &screen.geometry;
-    bail!(
-        "monitor {} ({},{} {}x{}) is not shared in the portal session (shared: {shared}); \
-         run `gnome-portal-bridge forget-session`, then start Computer Use again and \
-         select all monitors in the dialog",
-        screen.id,
-        g.x,
-        g.y,
-        g.width,
-        g.height
-    )
+    Err(kinded(
+        ErrorKind::NotShared,
+        format!(
+            "monitor {} ({},{} {}x{}) is not shared in the portal session (shared: {shared})",
+            screen.id, g.x, g.y, g.width, g.height
+        ),
+    ))
 }
 
 /// The Mutter monitor list, bounded; `None` when Mutter is unavailable.
@@ -1391,15 +1394,16 @@ mod tests {
     fn select_stream_refuses_an_unshared_monitor() {
         let streams = [stream(41, 1920, 0, 3440, 1440)];
         let mutter = [edp(), hdmi()];
-        let error = select_stream(&streams, &edp(), Some(&mutter))
-            .unwrap_err()
-            .to_string();
+        let error = select_stream(&streams, &edp(), Some(&mutter)).unwrap_err();
+        assert_eq!(
+            crate::error_kind::kind_of(&error),
+            Some(ErrorKind::NotShared)
+        );
+        let error = error.to_string();
         assert_eq!(
             error,
             "monitor eDP-1 (0,240 1920x1200) is not shared in the portal session \
-             (shared: HDMI-1 at 1920,0 3440x1440); run `gnome-portal-bridge \
-             forget-session`, then start Computer Use again and select all monitors \
-             in the dialog"
+             (shared: HDMI-1 at 1920,0 3440x1440)"
         );
         // Without Mutter the shared stream is named by its node.
         let error = select_stream(&streams, &edp(), None)

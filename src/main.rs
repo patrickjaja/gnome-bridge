@@ -2,6 +2,7 @@ mod capture;
 mod cli;
 mod daemon;
 mod doctor;
+mod error_kind;
 mod frames;
 mod input;
 mod output;
@@ -22,13 +23,16 @@ use crate::daemon::{
 };
 use crate::output::print_json;
 
+/// Exit codes follow the Computer Use bridge CLI contract v1: 0 success,
+/// 1 runtime error, 2 bad usage (clap), 3 monitor not shared in the portal
+/// session, 4 no live portal session (see `error_kind`).
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
-            ExitCode::FAILURE
+            ExitCode::from(error_kind::exit_code(error_kind::kind_of(&error)))
         }
     }
 }
@@ -41,7 +45,9 @@ async fn run() -> Result<()> {
             print_json(&doctor::doctor().await)?;
         }
         Command::Screens => {
-            print_json(&daemon::list_screens_with_sharing().await?)?;
+            // Never opens a portal session (contract v1): without Mutter
+            // and without a daemon this is an error, not a consent dialog.
+            print_json(&daemon::list_screens_with_sharing(daemon::Ephemeral::Refused).await?)?;
         }
         Command::Windows => {
             // Introspect is allowlist-restricted; an unavailable API yields [].
