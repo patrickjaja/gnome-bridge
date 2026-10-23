@@ -50,6 +50,22 @@ impl TokenStore {
         Ok(Some(stored.token))
     }
 
+    /// Delete the stored token. Returns whether there was one.
+    pub fn remove(&self) -> Result<bool> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to delete restore token `{}`", self.path.display())
+            }),
+        }
+    }
+
+    /// Where the token is stored.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
     pub fn save(&self, token: &str) -> Result<()> {
         let payload = serde_json::to_string_pretty(&StoredToken {
             token: token.to_owned(),

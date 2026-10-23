@@ -127,6 +127,10 @@ pub enum Command {
     },
     /// End the long-lived portal session daemon for this tool-use lock.
     SessionEnd,
+    /// End any session daemon and delete the stored portal restore token, so
+    /// the next session shows the consent dialog again (to share a different
+    /// set of monitors).
+    ForgetSession,
     /// Internal: run the session daemon serving a bound unix socket.
     #[command(hide = true)]
     ServeSession {

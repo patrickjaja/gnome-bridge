@@ -61,6 +61,14 @@ Persistence is requested through `RemoteDesktop.SelectDevices` only; the portal
 refuses it on `ScreenCast.SelectSources` for a remote-desktop session (see
 DESIGN.md).
 
+Select **all monitors** in the dialog. A monitor that was not shared is not
+silently replaced by another one: pointer and capture commands on it fail with
+`monitor <id> ... is not shared in the portal session`, and while a session
+daemon runs, `screens` reports `"is_shared": false` for it. To change the
+selection, run `gnome-portal-bridge forget-session` (ends the session and
+deletes the stored restore token; a plain `session-end` would replay the same
+selection), then start again and select all monitors in the dialog.
+
 ## Usage
 
 ```sh

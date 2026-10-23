@@ -8,6 +8,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Clicks landed off-target on scaled monitors.** `NotifyPointerMotionAbsolute`
+  takes stream VIDEO pixels, but the bridge sent logical offsets, so on a
+  1.3333-scaled panel a click aimed at (900,800) landed at (675,660). Points
+  are now scaled by the Mutter logical-monitor scale (`Screen.scale`, layout
+  mode aware) for Mutter-derived screens, and by the stream's video size over
+  its layout size only for screens derived from portal streams (no Mutter).
+  `screens` honors Mutter's physical layout mode (`layout-mode` = 2: physical
+  geometry, scale 1). Pointer input no longer starts the capture stream.
+- **Screenshots could be seconds old and memory grew to GBs.** lamco-pipewire
+  queues up to 256 frames and drops the newest when full, while the bridge
+  popped the oldest per capture. A drainer thread now keeps only the latest
+  frame per stream; a capture waits until frames go quiet for 70 ms (at most
+  300 ms) and returns the latest. The drainer restarts the PipeWire stream if
+  its thread exits.
+- **A screenshot after a click could show the pre-click screen, and kept
+  showing it.** Mutter records a monitor stream at most once per refresh
+  interval; an application repaint inside that interval (right after the
+  click's cursor frame) is left to a follow-up redraw, which on GNOME 51 with
+  two monitors repainted the other monitor, so the frame was never sent
+  (measured: 4 of 24 click-then-screenshot runs stale, all on the second
+  monitor). The first capture of the pointer's screen after pointer input now
+  moves the pointer 1 px and back, which makes Mutter record the pending
+  repaint (0 of 56 stale). Keyboard input does not trigger it, and it never
+  runs while a button is held.
+- **A click could run after its caller gave up.** The daemon serves one
+  request at a time; a request queued behind a slow one ran even though its
+  client had timed out. Input requests now carry the client's deadline and
+  are refused, unexecuted, once it passed or when the client hung up.
+- **Rebuilding a dead PipeWire connection reused the old socket.** It now asks
+  the portal for a new PipeWire remote; if that fails, the daemon exits so the
+  next `session-start` starts over.
+- **`session-end` could take about 9 s on a wedged daemon** (the JS exit hook
+  allows 5 s, leaving the sharing indicator on). It now signals a daemon that
+  does not answer within 1.5 s (worst case about 4 s), treats zombies as gone,
+  signals through a pidfd so a reused pid is never hit, and the daemon bounds
+  each client read/write so a stopped client cannot block it.
+- **`daemon.log` filled with "client went away before the reply" lines** while
+  the consent dialog was open (queued `session-start` pings answered after
+  their client timed out). Those are no longer logged.
+- **A monitor not shared in the consent dialog was silently replaced** by the
+  first shared one (clicks and screenshots on the wrong monitor). It is now an
+  error naming the shared monitors (single-head setups excepted), and
+  `screens` reports `is_shared` per monitor while a session daemon runs.
+  New `forget-session` drops the stored grant so the dialog can be answered
+  again.
+- **The outer band of a scaled monitor was unreachable** (`Invalid position`
+  from xdg-desktop-portal, which bounds-checks against the logical stream
+  size). Such targets are now reached by a clamped absolute motion plus a
+  relative remainder.
+- **A failing session daemon fell back to a second, ephemeral portal session**
+  (possibly sharing a different monitor). Only an absent daemon falls back
+  now; a broken or slow one returns its error with the daemon log path.
+- **Rotated monitors** report swapped width/height. Without `--display` the
+  default screen is a shared monitor. `session-start` waits 120 s for the consent
+  dialog and tells a declined dialog from a slow one.
 - **`screens` never reached Mutter.** The `GetCurrentState` decoder was one
   field short of Mutter's `(siiddada{sv})` mode signature (the preferred-scale
   double), and zbus rejects the whole reply on a signature mismatch, so every

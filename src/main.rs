@@ -2,6 +2,7 @@ mod capture;
 mod cli;
 mod daemon;
 mod doctor;
+mod frames;
 mod input;
 mod output;
 mod portal;
@@ -40,7 +41,7 @@ async fn run() -> Result<()> {
             print_json(&doctor::doctor().await)?;
         }
         Command::Screens => {
-            print_json(&daemon::list_screens_best_effort().await?)?;
+            print_json(&daemon::list_screens_with_sharing().await?)?;
         }
         Command::Windows => {
             // Introspect is allowlist-restricted; an unavailable API yields [].
@@ -197,6 +198,9 @@ async fn run() -> Result<()> {
         Command::SessionEnd => {
             print_json(&stop_session_daemon().await?)?;
         }
+        Command::ForgetSession => {
+            print_json(&daemon::forget_session().await?)?;
+        }
         Command::ServeSession { socket } => {
             let result = serve_session(std::path::PathBuf::from(socket)).await;
             exit_after_serve(result);
@@ -233,5 +237,6 @@ async fn resolve_screen_for_point(x: i32, y: i32) -> Result<output::Screen> {
     }) {
         return Ok(screen.clone());
     }
-    daemon::pick_screen(&screens, None)
+    // Outside every monitor: the default screen, preferring shared ones.
+    resolve_screen(None).await
 }

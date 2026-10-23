@@ -44,11 +44,48 @@ pub struct Screen {
     pub id: String,
     pub name: String,
     pub geometry: Rect,
-    /// Mutter logical scale (can be fractional, e.g. 1.25, 2.0).
+    /// Layout-unit -> stream-pixel factor: how many ScreenCast video pixels
+    /// one unit of `geometry` covers. In Mutter's logical layout mode this is
+    /// the monitor's scale (can be fractional, e.g. 1.25, 1.3333, 2.0); in
+    /// physical layout mode `geometry` is already in physical pixels and this
+    /// is 1.0. For stream-derived screens it is the negotiated video width
+    /// over the stream's layout width (1.0 until a frame was seen).
     pub scale: Option<f64>,
     pub refresh_millihz: Option<u32>,
     pub is_active: bool,
     pub is_primary: bool,
+    /// Whether the running session daemon's portal session has a ScreenCast
+    /// stream at this screen's origin, i.e. whether the bridge can capture and
+    /// point on it. Only set by the `screens` command while a daemon answers;
+    /// omitted otherwise (and never part of the JS contract).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_shared: Option<bool>,
+    /// Where this screen came from. It travels with the `Screen` embedded in
+    /// daemon requests (the daemon maps pointer coordinates differently per
+    /// source) and is left out of the JSON for Mutter screens, so the normal
+    /// `screens` output is unchanged; stream-derived screens print
+    /// `"source":"stream"` (not read by JS).
+    #[serde(default, skip_serializing_if = "ScreenSource::is_mutter")]
+    pub source: ScreenSource,
+}
+
+/// The provenance of a `Screen`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenSource {
+    /// Mutter DisplayConfig: `scale` is the logical monitor's layout scale,
+    /// the exact factor Mutter divides absolute pointer positions by.
+    #[default]
+    Mutter,
+    /// Derived from a portal ScreenCast stream (`id` = `stream-<node>`):
+    /// `scale` is only known from the negotiated video size.
+    Stream,
+}
+
+impl ScreenSource {
+    pub fn is_mutter(&self) -> bool {
+        *self == Self::Mutter
+    }
 }
 
 /// A screenshot of a full monitor. camelCase to match the JS

@@ -6,6 +6,13 @@
 //! them. We map that to the shared `Screen` JSON shape (snake_case, matching
 //! kwin-portal-bridge / x11-bridge).
 //!
+//! Units: `geometry` is in Mutter's LAYOUT units, the same space the portal
+//! reports ScreenCast stream positions/sizes in. In the default logical layout
+//! mode (`layout-mode` = 1) that is logical pixels and the stream's video is
+//! `layout * scale` physical pixels, so `Screen.scale` is the monitor scale. In
+//! physical layout mode (`layout-mode` = 2) the layout already is physical
+//! pixels, so geometry is the mode size and `Screen.scale` is 1.0.
+//!
 //! Fallback: if the Mutter API is unavailable (non-GNOME compositor exposing the
 //! portal, or DisplayConfig missing), the caller derives screens from the portal
 //! ScreenCast streams instead (see `portal.rs`).
@@ -14,7 +21,7 @@ use anyhow::{Context, Result};
 use zbus::Connection;
 use zbus::zvariant::OwnedValue;
 
-use crate::output::{Rect, Screen};
+use crate::output::{Rect, Screen, ScreenSource};
 
 /// The `GetCurrentState` reply signature (see the Mutter DisplayConfig docs):
 ///
@@ -90,8 +97,37 @@ pub async fn list_screens(connection: &Connection) -> Result<Vec<Screen>> {
         .deserialize()
         .context("failed to deserialize DisplayConfig GetCurrentState reply")?;
 
-    let (_serial, physical, logical, _props) = reply;
-    Ok(map_logical_monitors(&physical, &logical))
+    Ok(screens_from_reply(&reply))
+}
+
+/// Map a whole `GetCurrentState` reply, honoring its `layout-mode` property.
+pub(crate) fn screens_from_reply(reply: &GetCurrentStateReply) -> Vec<Screen> {
+    let (_serial, physical, logical, props) = reply;
+    map_logical_monitors(physical, logical, LayoutMode::from_props(props))
+}
+
+/// Mutter's `layout-mode` global property (GetCurrentState's 4th element).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutMode {
+    /// `1`: the layout is in logical pixels; a monitor's layout size is its
+    /// mode size divided by its scale. Also the default when the property is
+    /// missing (it is what every Mutter without the property does).
+    Logical,
+    /// `2`: the layout is in physical pixels; scale only affects how clients
+    /// render, not the layout, and the pointer maps 1:1 onto stream pixels.
+    Physical,
+}
+
+impl LayoutMode {
+    fn from_props(props: &std::collections::HashMap<String, OwnedValue>) -> Self {
+        match props
+            .get("layout-mode")
+            .and_then(|v| v.downcast_ref::<u32>().ok())
+        {
+            Some(2) => Self::Physical,
+            _ => Self::Logical,
+        }
+    }
 }
 
 /// Pure mapping from the DisplayConfig reply structs to `Screen` entries,
@@ -99,12 +135,13 @@ pub async fn list_screens(connection: &Connection) -> Result<Vec<Screen>> {
 pub fn map_logical_monitors(
     physical: &[PhysicalMonitor],
     logical: &[LogicalMonitor],
+    layout_mode: LayoutMode,
 ) -> Vec<Screen> {
     let single_head = logical.len() == 1;
 
     logical
         .iter()
-        .map(|(x, y, scale, _transform, primary, monitors, _props)| {
+        .map(|(x, y, scale, transform, primary, monitors, _props)| {
             // A logical monitor's connector name is the first assigned physical
             // monitor's connector; use it as both `id` and `name`.
             let connector = monitors
@@ -112,12 +149,26 @@ pub fn map_logical_monitors(
                 .map(|(c, _, _, _)| c.clone())
                 .unwrap_or_default();
 
-            // Logical (layout) size = current physical mode size / scale, since
-            // GNOME layouts in logical coordinates. The portal / cursor
-            // coordinate space the JS uses is logical, so report logical size.
-            let (phys_w, phys_h, refresh) = connector_current_mode(physical, &connector);
-            let logical_w = (f64::from(phys_w) / scale).round() as i32;
-            let logical_h = (f64::from(phys_h) / scale).round() as i32;
+            // Layout size: in logical mode the current physical mode size /
+            // scale, in physical mode the mode size itself. `layout_scale` is
+            // what one layout unit is worth in stream (video) pixels - the
+            // factor the pointer path multiplies by (see `Screen.scale`).
+            let (mode_w, mode_h, refresh) = connector_current_mode(physical, &connector);
+            // The mode is in the panel's native orientation; a logical
+            // monitor rotated by 90/270 degrees (odd Mutter transforms: 1, 3
+            // and their flipped variants 5, 7) is laid out - and streamed -
+            // with width and height swapped.
+            let (phys_w, phys_h) = if transform % 2 == 1 {
+                (mode_h, mode_w)
+            } else {
+                (mode_w, mode_h)
+            };
+            let layout_scale = match layout_mode {
+                LayoutMode::Logical if scale.is_finite() && *scale > 0.0 => *scale,
+                _ => 1.0,
+            };
+            let logical_w = (f64::from(phys_w) / layout_scale).round() as i32;
+            let logical_h = (f64::from(phys_h) / layout_scale).round() as i32;
 
             let is_primary = *primary || single_head;
 
@@ -128,12 +179,14 @@ pub fn map_logical_monitors(
                     width: logical_w.max(1),
                     height: logical_h.max(1),
                 },
-                scale: Some(*scale),
+                scale: Some(layout_scale),
                 refresh_millihz: refresh.map(|r| (r * 1000.0).round() as u32),
                 is_active: is_primary,
                 is_primary,
                 name: connector.clone(),
                 id: connector,
+                is_shared: None,
+                source: ScreenSource::Mutter,
             }
         })
         .collect()
@@ -170,7 +223,7 @@ fn mode_is_current(props: &std::collections::HashMap<String, OwnedValue>) -> boo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use zbus::zvariant::{Type, Value};
@@ -222,7 +275,7 @@ mod tests {
         )];
         let logical = vec![(0, 0, 2.0, 0u32, true, vec![ident("eDP-1")], HashMap::new())];
 
-        let screens = map_logical_monitors(&physical, &logical);
+        let screens = map_logical_monitors(&physical, &logical, LayoutMode::Logical);
         assert_eq!(screens.len(), 1);
         let s = &screens[0];
         assert_eq!(s.id, "eDP-1");
@@ -265,7 +318,7 @@ mod tests {
             ),
         ];
 
-        let screens = map_logical_monitors(&physical, &logical);
+        let screens = map_logical_monitors(&physical, &logical, LayoutMode::Logical);
         assert_eq!(screens.len(), 2);
         assert_eq!(screens[0].id, "eDP-1");
         assert!(screens[0].is_primary);
@@ -275,5 +328,159 @@ mod tests {
         assert_eq!(screens[1].geometry.x, 1920);
         assert_eq!(screens[1].geometry.width, 2560);
         assert_eq!(screens[1].refresh_millihz, Some(144_000));
+    }
+
+    #[test]
+    fn layout_mode_prop_decodes() {
+        let mut props: HashMap<String, OwnedValue> = HashMap::new();
+        assert_eq!(LayoutMode::from_props(&props), LayoutMode::Logical);
+        props.insert(
+            "layout-mode".to_owned(),
+            OwnedValue::try_from(Value::U32(1)).unwrap(),
+        );
+        assert_eq!(LayoutMode::from_props(&props), LayoutMode::Logical);
+        props.insert(
+            "layout-mode".to_owned(),
+            OwnedValue::try_from(Value::U32(2)).unwrap(),
+        );
+        assert_eq!(LayoutMode::from_props(&props), LayoutMode::Physical);
+    }
+
+    /// The layout that exposed claude-desktop-extra #293: a 1.3333-scaled
+    /// laptop panel below-left of a scale-1 ultrawide, logical layout mode.
+    #[test]
+    fn maps_fractional_logical_layout_of_issue_293() {
+        let physical = vec![
+            (
+                ident("eDP-1"),
+                vec![current_mode(2560, 1600, 60.0)],
+                HashMap::new(),
+            ),
+            (
+                ident("HDMI-1"),
+                vec![current_mode(3440, 1440, 60.0)],
+                HashMap::new(),
+            ),
+        ];
+        let logical = vec![
+            (
+                0,
+                240,
+                4.0 / 3.0,
+                0u32,
+                true,
+                vec![ident("eDP-1")],
+                HashMap::new(),
+            ),
+            (
+                1920,
+                0,
+                1.0,
+                0u32,
+                false,
+                vec![ident("HDMI-1")],
+                HashMap::new(),
+            ),
+        ];
+        let screens = map_logical_monitors(&physical, &logical, LayoutMode::Logical);
+        let edp = &screens[0];
+        assert_eq!(
+            (
+                edp.geometry.x,
+                edp.geometry.y,
+                edp.geometry.width,
+                edp.geometry.height
+            ),
+            (0, 240, 1920, 1200)
+        );
+        assert!((edp.scale.unwrap() - 4.0 / 3.0).abs() < 1e-9);
+        assert_eq!(screens[1].geometry.width, 3440);
+        assert_eq!(screens[1].scale, Some(1.0));
+    }
+
+    /// A whole `GetCurrentState` reply in physical layout mode
+    /// (`layout-mode` = 2): geometry is the mode size, NOT divided by the
+    /// scale, and the layout -> stream factor is 1.
+    pub(crate) fn physical_mode_reply() -> GetCurrentStateReply {
+        let physical = vec![(
+            ident("eDP-1"),
+            vec![current_mode(2560, 1600, 60.0)],
+            HashMap::new(),
+        )];
+        let logical = vec![(
+            0,
+            0,
+            4.0 / 3.0,
+            0u32,
+            true,
+            vec![ident("eDP-1")],
+            HashMap::new(),
+        )];
+        let mut props: HashMap<String, OwnedValue> = HashMap::new();
+        props.insert(
+            "layout-mode".to_owned(),
+            OwnedValue::try_from(Value::U32(2)).unwrap(),
+        );
+        (1, physical, logical, props)
+    }
+
+    #[test]
+    fn maps_physical_layout_mode_without_dividing() {
+        let screens = screens_from_reply(&physical_mode_reply());
+        let s = &screens[0];
+        assert_eq!((s.geometry.width, s.geometry.height), (2560, 1600));
+        assert_eq!(s.scale, Some(1.0));
+    }
+
+    /// A portrait (90-degree, transform 1) and a flipped-270 (transform 7)
+    /// monitor are laid out with width and height swapped; 180 (2) is not.
+    #[test]
+    fn rotated_monitors_swap_width_and_height() {
+        let physical = vec![
+            (
+                ident("DP-1"),
+                vec![current_mode(2560, 1440, 60.0)],
+                HashMap::new(),
+            ),
+            (
+                ident("DP-2"),
+                vec![current_mode(3840, 2160, 60.0)],
+                HashMap::new(),
+            ),
+            (
+                ident("DP-3"),
+                vec![current_mode(1920, 1080, 60.0)],
+                HashMap::new(),
+            ),
+        ];
+        let logical = vec![
+            (0, 0, 1.0, 1u32, true, vec![ident("DP-1")], HashMap::new()),
+            (
+                1440,
+                0,
+                2.0,
+                7u32,
+                false,
+                vec![ident("DP-2")],
+                HashMap::new(),
+            ),
+            (
+                2520,
+                0,
+                1.0,
+                2u32,
+                false,
+                vec![ident("DP-3")],
+                HashMap::new(),
+            ),
+        ];
+        let screens = map_logical_monitors(&physical, &logical, LayoutMode::Logical);
+        let size = |s: &Screen| (s.geometry.width, s.geometry.height);
+        assert_eq!(size(&screens[0]), (1440, 2560));
+        assert_eq!(size(&screens[1]), (1080, 1920));
+        assert_eq!(size(&screens[2]), (1920, 1080));
+        // Physical layout mode: swapped, not divided.
+        let screens = map_logical_monitors(&physical, &logical, LayoutMode::Physical);
+        assert_eq!(size(&screens[1]), (2160, 3840));
     }
 }
