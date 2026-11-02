@@ -359,3 +359,112 @@ fn listing_still_works_while_stopped() {
         assert_ne!(code(&output), 5, "{args:?}");
     }
 }
+
+impl Sandbox {
+    fn run_with_stdin(&self, args: &[&str], stdin: &[u8]) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(BIN)
+            .args(args)
+            .env_clear()
+            .env("HOME", self.root.join("home"))
+            .env("XDG_STATE_HOME", self.state())
+            .env("XDG_RUNTIME_DIR", self.runtime())
+            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to run the bridge binary");
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        child.wait_with_output().unwrap()
+    }
+}
+
+#[test]
+fn doctor_has_an_atspi_key_that_never_fails() {
+    let report = json(&Sandbox::new("doctor-atspi").run(&["doctor"]));
+    let atspi = &report["atspi"];
+    assert_eq!(atspi["bus"], false, "{atspi}");
+    assert_eq!(atspi["is_enabled"], false);
+    assert!(atspi["screen_reader"].is_boolean());
+    assert!(atspi["error"].is_string(), "{atspi}");
+}
+
+#[test]
+fn ax_usage_errors_exit_2() {
+    let sandbox = Sandbox::new("ax-usage");
+    for args in [
+        &["ax-find"][..],
+        &["ax-find", "--title", "x"],
+        &["ax-enable"],
+        &["ax-restore", "--holder-pid", "abc"],
+        &["ax-action", "--scope", "s", "--ref", "r"],
+        &[
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "type",
+        ],
+        &[
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "set-text",
+            "--text",
+            "x",
+        ],
+    ] {
+        assert_eq!(code(&sandbox.run(args)), 2, "{args:?}");
+    }
+    let output = sandbox.run_with_stdin(
+        &[
+            "ax-action",
+            "--scope",
+            "s",
+            "--ref",
+            "r",
+            "--action",
+            "set-text",
+        ],
+        b"secret\xff",
+    );
+    assert_eq!(code(&output), 2);
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret"));
+}
+
+#[test]
+fn ax_commands_without_a_bus_never_need_a_portal_session() {
+    let sandbox = Sandbox::new("ax-nobus");
+    // Unknown window, no session bus: an `unavailable` result, exit 0.
+    let v = json(&sandbox.run(&["ax-find", "--window", "42"]));
+    assert_eq!(v["unavailable"], "window_not_found", "{v}");
+    // By app id: the crate reports the missing accessibility bus.
+    let v = json(&sandbox.run(&["ax-find", "--app-id", "org.gnome.TextEditor"]));
+    assert_eq!(v["unavailable"], "no_atspi_bus", "{v}");
+    // Still answers while screen sharing is stopped (not an input command).
+    sandbox.plant_stopped_marker();
+    let v = json(&sandbox.run(&["ax-find", "--app-id", "org.gnome.TextEditor"]));
+    assert_eq!(v["unavailable"], "no_atspi_bus", "{v}");
+    let output = sandbox.run_with_stdin(
+        &[
+            "ax-action",
+            "--scope",
+            "v1|:1.1|/a|-",
+            "--ref",
+            ":1.1/a",
+            "--action",
+            "set-text",
+        ],
+        b"hidden text",
+    );
+    assert_ne!(code(&output), 5);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("hidden text"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("hidden text"));
+}

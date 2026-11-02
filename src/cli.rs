@@ -131,6 +131,60 @@ pub enum Command {
     /// the next session shows the consent dialog again (to share a different
     /// set of monitors).
     ForgetSession,
+    /// Turn desktop accessibility (AT-SPI IsEnabled) on for a holder process.
+    /// Never opens a portal session.
+    AxEnable {
+        /// The long-lived process that needs accessibility (Claude's main process).
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// Drop a holder; turn accessibility back off when it was ours and no
+    /// holder is left.
+    AxRestore {
+        #[arg(long)]
+        holder_pid: u32,
+    },
+    /// List the accessible elements of a window (from `windows`, or by app id).
+    #[command(group(clap::ArgGroup::new("target").required(true).multiple(true).args(["window", "app_id"])))]
+    AxFind {
+        /// Window id from `windows` (GNOME Shell Introspect).
+        #[arg(long)]
+        window: Option<String>,
+        /// App id (desktop file id) when Introspect does not list windows.
+        #[arg(long)]
+        app_id: Option<String>,
+        /// Window title, with --app-id.
+        #[arg(long)]
+        title: Option<String>,
+        /// Role filter: AX name ("AXButton") or AT-SPI name ("push button").
+        #[arg(long)]
+        role: Option<String>,
+        /// Name or description substring, case-insensitive.
+        #[arg(long)]
+        title_contains: Option<String>,
+        /// Not only interactive elements.
+        #[arg(long, default_value_t = false)]
+        all: bool,
+        /// Also walk elements that are not showing.
+        #[arg(long, default_value_t = false)]
+        include_hidden: bool,
+        #[arg(long)]
+        max_nodes: Option<usize>,
+        #[arg(long)]
+        max_depth: Option<u32>,
+    },
+    /// Act on an element from `ax-find`. The text for set-text is read from
+    /// stdin (whole, UTF-8, untrimmed), never from argv.
+    AxAction {
+        /// The `scope` value `ax-find` returned.
+        #[arg(long)]
+        scope: String,
+        /// The element's `ref` from `ax-find`.
+        #[arg(long = "ref")]
+        element_ref: String,
+        #[arg(long, value_enum)]
+        action: crate::ax::AxActionKind,
+    },
     /// Internal: run the session daemon serving a bound unix socket.
     #[command(hide = true)]
     ServeSession {

@@ -1,3 +1,4 @@
+mod ax;
 mod capture;
 mod cli;
 mod daemon;
@@ -34,6 +35,9 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
+            if error.downcast_ref::<ax::UsageError>().is_some() {
+                return ExitCode::from(2);
+            }
             ExitCode::from(error_kind::exit_code(error_kind::kind_of(&error)))
         }
     }
@@ -219,6 +223,37 @@ async fn run() -> Result<()> {
             // `stop_session_daemon` (inside) removes the stopped marker.
             print_json(&daemon::forget_session().await?)?;
         }
+        Command::AxEnable { holder_pid } => ax::enable(holder_pid).await?,
+        Command::AxRestore { holder_pid } => ax::restore(holder_pid).await?,
+        Command::AxFind {
+            window,
+            app_id,
+            title,
+            role,
+            title_contains,
+            all,
+            include_hidden,
+            max_nodes,
+            max_depth,
+        } => {
+            ax::find(ax::FindArgs {
+                window,
+                app_id,
+                title,
+                role,
+                title_contains,
+                all,
+                include_hidden,
+                max_nodes,
+                max_depth,
+            })
+            .await?;
+        }
+        Command::AxAction {
+            scope,
+            element_ref,
+            action,
+        } => ax::action(&scope, &element_ref, action).await?,
         Command::ServeSession { socket } => {
             let result = serve_session(std::path::PathBuf::from(socket)).await;
             exit_after_serve(result);
@@ -254,6 +289,10 @@ fn uses_portal(command: &Command) -> bool {
         | Command::SessionStart { .. }
         | Command::SessionEnd
         | Command::ForgetSession
+        | Command::AxEnable { .. }
+        | Command::AxRestore { .. }
+        | Command::AxFind { .. }
+        | Command::AxAction { .. }
         | Command::ServeSession { .. } => false,
     }
 }
@@ -335,6 +374,18 @@ mod tests {
             &["session-start"],
             &["session-end"],
             &["forget-session"],
+            &["ax-enable", "--holder-pid", "1"],
+            &["ax-restore", "--holder-pid", "1"],
+            &["ax-find", "--window", "1"],
+            &[
+                "ax-action",
+                "--scope",
+                "s",
+                "--ref",
+                "r",
+                "--action",
+                "click",
+            ],
         ] {
             assert!(!uses_portal(&command(args)), "{args:?}");
         }

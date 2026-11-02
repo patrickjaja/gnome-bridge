@@ -20,6 +20,7 @@ serde_json = { version = "1.0.149", default-features = false, features = ["std"]
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], default-features = false }
 libc = { version = "0.2.186", default-features = false, features = ["std"] }
 xkeysym = "0.2.1"
+cu-atspi = { git = "https://github.com/patrickjaja/cu-atspi", rev = "a390259e9209fda8bb518a8ef253198ba3435ef0" }
 
 [profile.release]
 strip = true

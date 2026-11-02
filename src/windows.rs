@@ -10,10 +10,11 @@
 //! regression.
 //!
 //! `GetWindows` returns `a{ta{sv}}` - a map of window-id -> property map. The
-//! documented per-window keys are: `app-id` (s), `client-type` (u),
-//! `is-hidden` (b), `has-focus` (b), `width`/`height` (u), `title` (s),
-//! `wm-class` (s), plus (on newer Shells) `frame-rect` and `gtk-application-id`.
-//! Not all keys are present on all versions, so every field read is optional.
+//! per-window keys (GNOME Shell 45 through 51, `js/misc/introspect.js`) are
+//! `app-id` (s), `client-type` (u, 0 Wayland / 1 X11), `is-hidden` (b),
+//! `has-focus` (b), `width`/`height` (u, frame rect size), and when set
+//! `title` (s), `wm-class` (s), `sandboxed-app-id` (s). There is no pid and no
+//! position. Every field read is optional.
 
 use std::collections::HashMap;
 
@@ -23,12 +24,12 @@ use zbus::zvariant::OwnedValue;
 
 use crate::output::{AppRef, Rect, WindowInfo};
 
-type WindowMap = HashMap<u64, HashMap<String, OwnedValue>>;
+pub type WindowMap = HashMap<u64, HashMap<String, OwnedValue>>;
 
 /// Call `GetWindows`, returning the raw window map. Errors (including the
 /// allowlist rejection) propagate to the caller, which downgrades them to an
 /// empty result.
-async fn get_windows_raw(connection: &Connection) -> Result<WindowMap> {
+pub async fn get_windows_raw(connection: &Connection) -> Result<WindowMap> {
     let reply: WindowMap = connection
         .call_method(
             Some("org.gnome.Shell"),

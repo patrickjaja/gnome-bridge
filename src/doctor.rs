@@ -66,6 +66,9 @@ pub struct DoctorReport {
     pub restore_token_dir: String,
     /// Where a detached daemon's stderr lands.
     pub daemon_log: String,
+    /// Accessibility bus state for the `ax-*` commands (optional contract
+    /// key, issue #306). Never fails `doctor`, never activates the a11y bus.
+    pub atspi: cu_atspi::AtspiDoctor,
 }
 
 /// Run a probe bounded by `PROBE_TIMEOUT`; a timeout is `None`.
@@ -218,7 +221,8 @@ pub async fn doctor() -> DoctorReport {
             bounded(introspect_available(conn)),
         ))
     };
-    let (bus, daemon_running) = tokio::join!(bus_probes, daemon::daemon_running());
+    let (bus, daemon_running, atspi) =
+        tokio::join!(bus_probes, daemon::daemon_running(), crate::ax::doctor());
 
     let (bus, rd, sc, mutter, shell, introspect) = match bus {
         Ok((rd, sc, mutter, shell, introspect)) => {
@@ -276,6 +280,7 @@ pub async fn doctor() -> DoctorReport {
         daemon_log: daemon::log_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_owned()),
+        atspi,
     }
 }
 
