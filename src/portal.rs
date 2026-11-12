@@ -49,7 +49,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, bail};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::remote_desktop::{
-    DeviceType, RemoteDesktop, SelectDevicesOptions, StartOptions,
+    Axis, DeviceType, NotifyPointerAxisDiscreteOptions, RemoteDesktop, SelectDevicesOptions,
+    StartOptions,
 };
 use ashpd::desktop::screencast::{
     CursorMode, Screencast, SelectSourcesOptions, SourceType as SourceTypeFlag,
@@ -108,6 +109,10 @@ const PIPEWIRE_SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// whole tool-use lock.
 pub struct LivePortalSession {
     manager: PortalManager,
+    /// The proxy the session was created on (same bus connection as
+    /// `manager`'s); for the portal calls lamco-portal does not wrap
+    /// (`NotifyPointerAxisDiscrete`).
+    remote_desktop: RemoteDesktop,
     session: PortalSessionHandle,
     streams: Vec<Stream>,
     pipewire: Option<PipeWire>,
@@ -266,7 +271,7 @@ struct PipeWire {
 impl LivePortalSession {
     /// Open a new portal session, reusing a persisted restore token if present.
     pub async fn open() -> Result<Self> {
-        let (manager, (session, closed), _restore_token) = start_session().await?;
+        let (manager, remote_desktop, (session, closed), _restore_token) = start_session().await?;
         let streams = session
             .streams()
             .iter()
@@ -279,6 +284,7 @@ impl LivePortalSession {
             .collect();
         Ok(Self {
             manager,
+            remote_desktop,
             session,
             streams,
             pipewire: None,
@@ -497,11 +503,30 @@ impl LivePortalSession {
         dy: f64,
     ) -> Result<PointerActionResult> {
         self.motion_absolute(screen, x, y).await?;
-        self.manager
-            .remote_desktop()
-            .notify_pointer_axis(self.session.ashpd_session(), dx, dy)
-            .await
-            .context("failed to send scroll event through the portal")?;
+        // Wheel notches, not smooth pixels: `NotifyPointerAxis` is a
+        // finger-source scroll in surface pixels, so `--dy 3` moved 3 px in
+        // GTK4 apps and nothing at all in terminals and X11 apps.
+        // `NotifyPointerAxisDiscrete` is a wheel click per step (Mutter
+        // emits one discrete wheel event per step: a 120-unit notch to
+        // Wayland clients, button 4-7 to X11 ones), like a real mouse wheel
+        // and like the other bridges' notches.
+        for (axis, steps) in [
+            (Axis::Vertical, scroll_steps(dy)),
+            (Axis::Horizontal, scroll_steps(dx)),
+        ] {
+            if steps == 0 {
+                continue;
+            }
+            self.remote_desktop
+                .notify_pointer_axis_discrete(
+                    self.session.ashpd_session(),
+                    axis,
+                    steps,
+                    NotifyPointerAxisDiscreteOptions::default(),
+                )
+                .await
+                .context("failed to send scroll event through the portal")?;
+        }
         Ok(PointerActionResult {
             action: "scroll".to_owned(),
             x,
@@ -1093,6 +1118,7 @@ fn resolve_key_spec(spec: &str) -> Result<Vec<u32>> {
 
 async fn start_session() -> Result<(
     PortalManager,
+    RemoteDesktop,
     (PortalSessionHandle, ClosedWatch),
     Option<String>,
 )> {
@@ -1119,7 +1145,7 @@ async fn start_session() -> Result<(
             if let Some(ref token) = restore_token {
                 token_store.save(token).ok();
             }
-            Ok((manager, session, restore_token))
+            Ok((manager, remote_desktop, session, restore_token))
         }
         Err(error) if persistence == Persistence::Requested && is_persistence_rejection(&error) => {
             // A backend that advertises v2 but refuses to persist (or a token
@@ -1133,7 +1159,7 @@ async fn start_session() -> Result<(
                 try_start_session(&remote_desktop, &config, None, Persistence::Unsupported)
                     .await
                     .context("failed to create session after persistence fallback")?;
-            Ok((manager, session, restore_token))
+            Ok((manager, remote_desktop, session, restore_token))
         }
         Err(error) => Err(error),
     }
@@ -1339,9 +1365,43 @@ fn dup_fd(raw_fd: i32) -> Result<OwnedFd> {
     Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
+/// Wheel notches for a scroll amount: positive = down / right (the portal's
+/// and this bridge's convention), rounded, at least one notch for any
+/// non-zero amount, bounded so a runaway value cannot queue an endless
+/// scroll.
+pub fn scroll_steps(amount: f64) -> i32 {
+    const MAX_STEPS: f64 = 100.0;
+    if !amount.is_finite() || amount == 0.0 {
+        return 0;
+    }
+    let steps = amount.round().clamp(-MAX_STEPS, MAX_STEPS);
+    if steps == 0.0 {
+        amount.signum() as i32
+    } else {
+        steps as i32
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_amounts_become_wheel_notches() {
+        assert_eq!(scroll_steps(0.0), 0);
+        assert_eq!(scroll_steps(-0.0), 0);
+        assert_eq!(scroll_steps(3.0), 3);
+        assert_eq!(scroll_steps(-5.0), -5);
+        assert_eq!(scroll_steps(2.4), 2);
+        assert_eq!(scroll_steps(2.6), 3);
+        // Any non-zero amount scrolls at least one notch, in its direction.
+        assert_eq!(scroll_steps(0.2), 1);
+        assert_eq!(scroll_steps(-0.4), -1);
+        assert_eq!(scroll_steps(1e9), 100);
+        assert_eq!(scroll_steps(-1e9), -100);
+        assert_eq!(scroll_steps(f64::NAN), 0);
+        assert_eq!(scroll_steps(f64::INFINITY), 0);
+    }
 
     fn screen(id: &str, x: i32, y: i32, w: i32, h: i32, scale: f64) -> Screen {
         Screen {
