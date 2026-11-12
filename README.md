@@ -78,7 +78,8 @@ stopped (the portal session was closed by the user or the desktop)`) without ope
 ## Usage
 
 ```sh
-# Diagnostics: DE, portal versions, GNOME Shell version, Introspect availability.
+# Diagnostics: DE, portal versions, GNOME Shell version, Introspect availability,
+# overlay capabilities.
 gnome-portal-bridge doctor
 
 # Start a session daemon for a tool-use lock (one consent), then act, then end.
@@ -90,7 +91,16 @@ gnome-portal-bridge pointer-click --x 400 --y 300 --button left --count 1
 gnome-portal-bridge session-end
 ```
 
-Every subcommand is short-lived and prints one JSON object/array on stdout.
+Every subcommand except `overlay` is short-lived and prints one JSON object/array on stdout.
+
+`overlay` draws Claude's Computer Use glow, drawn cursor and badge (the shared
+[cu-overlay](https://github.com/patrickjaja/cu-overlay) crate, protocol 1 on
+stdin / stdout) as click-through XWayland windows, since Mutter has no
+layer-shell. It needs XWayland (`doctor` reports
+`capabilities.overlay`); the windows are in every portal capture, so the
+caller hides them with the protocol's `capture` command around each
+`screenshot` / `zoom` and restores only after the capture returned. See
+[DESIGN.md](DESIGN.md#overlay).
 Without a running daemon, capture and input commands open an ephemeral portal session,
 act, and tear down. See [DESIGN.md](DESIGN.md) for the full CLI/JSON contract.
 

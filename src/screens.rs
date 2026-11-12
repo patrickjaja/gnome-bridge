@@ -83,7 +83,17 @@ type GetCurrentStateReply = (
 /// Returns an error if the DisplayConfig service is not reachable; callers may
 /// then fall back to the portal streams.
 pub async fn list_screens(connection: &Connection) -> Result<Vec<Screen>> {
-    let reply: GetCurrentStateReply = connection
+    Ok(screens_from_reply(&current_state(connection).await?))
+}
+
+/// Mutter's layout mode (`overlay` passes it to cu-overlay as a scale hint).
+pub async fn layout_mode(connection: &Connection) -> Result<LayoutMode> {
+    let (_serial, _physical, _logical, props) = current_state(connection).await?;
+    Ok(LayoutMode::from_props(&props))
+}
+
+async fn current_state(connection: &Connection) -> Result<GetCurrentStateReply> {
+    connection
         .call_method(
             Some("org.gnome.Mutter.DisplayConfig"),
             "/org/gnome/Mutter/DisplayConfig",
@@ -95,9 +105,7 @@ pub async fn list_screens(connection: &Connection) -> Result<Vec<Screen>> {
         .context("failed to call org.gnome.Mutter.DisplayConfig.GetCurrentState")?
         .body()
         .deserialize()
-        .context("failed to deserialize DisplayConfig GetCurrentState reply")?;
-
-    Ok(screens_from_reply(&reply))
+        .context("failed to deserialize DisplayConfig GetCurrentState reply")
 }
 
 /// Map a whole `GetCurrentState` reply, honoring its `layout-mode` property.

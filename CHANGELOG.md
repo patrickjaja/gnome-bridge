@@ -4,6 +4,30 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-12 (0.2.0)
+
+### Added
+
+- **`overlay` subcommand.** Claude's Computer Use glow, drawn cursor, press
+  ring and badge through the shared cu-overlay crate (protocol 1) on its
+  XWayland backend. The bridge reads Mutter's layout mode first and, in the
+  physical layout mode, tells the crate the X factor is 1 (from X it looks
+  like native scaling), so `ready.outputs` matches `screens`. The glow is
+  static.
+- **`doctor` `capabilities`** (`overlay`, `overlay_alpha_modifier`,
+  `overlay_fractional_scale`), the same keys as the other bridges. Checks the
+  XWayland socket without connecting.
+
+### Fixed
+
+- **`pointer-scroll` did not scroll terminals or X11 apps.** It sent a
+  finger-source smooth scroll of `dy` pixels (`--dy 3` = 3 px). It now sends
+  `dy` / `dx` wheel notches (`NotifyPointerAxisDiscrete`); verified on GNOME 48
+  in GNOME Terminal, xterm, Text Editor, Files and Firefox.
+- **`app-under-point` named windows that were not under the point.** Shell
+  Introspect gives no window position; the hit test assumed every window at
+  0,0. It now always returns `null`.
+
 ## 2026-10-23
 
 ### Fixed

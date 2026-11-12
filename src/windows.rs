@@ -15,6 +15,12 @@
 //! `has-focus` (b), `width`/`height` (u, frame rect size), and when set
 //! `title` (s), `wm-class` (s), `sandboxed-app-id` (s). There is no pid and no
 //! position. Every field read is optional.
+//!
+//! Only windows of tracked apps are listed: the `overlay` subcommand's
+//! override-redirect XWayland windows (`claude-cu-overlay`, skip-taskbar) are
+//! in Mutter's window list but never in Introspect's (verified on GNOME 48),
+//! so the caller's own overlay is never an app, never frontmost and never
+//! under a point.
 
 use std::collections::HashMap;
 

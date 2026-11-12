@@ -69,6 +69,61 @@ pub struct DoctorReport {
     /// Accessibility bus state for the `ax-*` commands (optional contract
     /// key, issue #306). Never fails `doctor`, never activates the a11y bus.
     pub atspi: cu_atspi::AtspiDoctor,
+    /// What the `overlay` subcommand can do here (additive; the same keys as
+    /// wlroots-bridge and kwin-portal-bridge).
+    pub capabilities: Capabilities,
+}
+
+/// `capabilities`: `overlay` = the overlay can run here (a GNOME Wayland
+/// session with an XWayland display to connect to); `overlay_alpha_modifier`
+/// = fades, capture hides and opacity work (`_NET_WM_WINDOW_OPACITY`, always
+/// with the x11 backend); `overlay_fractional_scale` = drawn at a monitor's
+/// exact fractional scale (never on X). The same values cu-overlay's x11
+/// backend reports in `ready`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct Capabilities {
+    pub overlay: bool,
+    pub overlay_alpha_modifier: bool,
+    pub overlay_fractional_scale: bool,
+}
+
+impl Capabilities {
+    pub fn new(session_match: bool, xwayland: bool) -> Self {
+        let overlay = session_match && xwayland;
+        Self {
+            overlay,
+            overlay_alpha_modifier: overlay,
+            overlay_fractional_scale: false,
+        }
+    }
+}
+
+/// The X display number of a local `$DISPLAY` (`:0`, `:1.0`, `unix:0`);
+/// `None` for an empty, malformed or remote (TCP) display.
+pub fn local_display_number(display: &str) -> Option<u32> {
+    let rest = display
+        .strip_prefix("unix:")
+        .or_else(|| display.strip_prefix(':'))?;
+    let number = rest.split('.').next()?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
+}
+
+/// Whether `$DISPLAY` names an X server the overlay can reach, WITHOUT
+/// connecting: Mutter starts XWayland on demand when a client connects
+/// (180-270 ms cold), so `doctor` only checks that `$DISPLAY` is local and
+/// its socket exists. Mutter creates `/tmp/.X11-unix/X<n>` itself and keeps
+/// it while it can start XWayland; a Mutter without XWayland sets no
+/// `$DISPLAY` and creates no socket. A plain stat, no I/O on the socket.
+fn xwayland_reachable(display: Option<&str>) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let Some(number) = display.and_then(local_display_number) else {
+        return false;
+    };
+    std::fs::metadata(format!("/tmp/.X11-unix/X{number}"))
+        .is_ok_and(|meta| meta.file_type().is_socket())
 }
 
 /// Run a probe bounded by `PROBE_TIMEOUT`; a timeout is `None`.
@@ -281,6 +336,10 @@ pub async fn doctor() -> DoctorReport {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_owned()),
         atspi,
+        capabilities: Capabilities::new(
+            session_match,
+            xwayland_reachable(env("DISPLAY").as_deref()),
+        ),
     }
 }
 
@@ -301,6 +360,46 @@ mod tests {
         assert!(!is_gnome_wayland(Some("wayland"), None, Some("KDE")));
         assert!(!is_gnome_wayland(Some("wayland"), Some(""), None));
         assert!(!is_gnome_wayland(None, None, None));
+    }
+
+    #[test]
+    fn capabilities_json() {
+        let json = |c: Capabilities| serde_json::to_value(c).unwrap();
+        let all_false = serde_json::json!({
+            "overlay": false, "overlay_alpha_modifier": false, "overlay_fractional_scale": false
+        });
+        assert_eq!(json(Capabilities::default()), all_false);
+        assert_eq!(
+            json(Capabilities::new(false, true)),
+            all_false,
+            "not GNOME Wayland"
+        );
+        assert_eq!(
+            json(Capabilities::new(true, false)),
+            all_false,
+            "no XWayland"
+        );
+        assert_eq!(
+            json(Capabilities::new(true, true)),
+            serde_json::json!({
+                "overlay": true, "overlay_alpha_modifier": true, "overlay_fractional_scale": false
+            })
+        );
+    }
+
+    #[test]
+    fn display_numbers() {
+        assert_eq!(local_display_number(":0"), Some(0));
+        assert_eq!(local_display_number(":1.0"), Some(1));
+        assert_eq!(local_display_number("unix:12"), Some(12));
+        assert_eq!(local_display_number(""), None);
+        assert_eq!(local_display_number(":"), None);
+        assert_eq!(local_display_number("host:0"), None);
+        assert_eq!(local_display_number("localhost:10.0"), None);
+        assert_eq!(local_display_number(":x"), None);
+        assert!(!xwayland_reachable(None));
+        assert!(!xwayland_reachable(Some("")));
+        assert!(!xwayland_reachable(Some(":4242")));
     }
 
     #[test]

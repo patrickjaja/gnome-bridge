@@ -7,6 +7,7 @@ mod error_kind;
 mod frames;
 mod input;
 mod output;
+mod overlay;
 mod portal;
 mod screens;
 mod stopped;
@@ -29,9 +30,31 @@ use crate::output::print_json;
 /// 1 runtime error, 2 bad usage (clap), 3 monitor not shared in the portal
 /// session, 4 no live portal session, 5 the user stopped screen sharing (see
 /// `error_kind` and `stopped`).
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run().await {
+fn main() -> ExitCode {
+    // Bad usage exits 2 inside `parse`.
+    let cli = Cli::parse();
+
+    // overlay: before the tokio runtime. cu-overlay owns stdin / stdout
+    // (protocol lines only), the parent-death watch and the exit code, and
+    // blocks on its own X connection.
+    if matches!(cli.command, Command::Overlay) {
+        return overlay::run();
+    }
+
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(async_main(cli)),
+        Err(error) => {
+            eprintln!("failed to start the tokio runtime: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main(cli: Cli) -> ExitCode {
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
@@ -43,9 +66,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run() -> Result<()> {
-    let cli = Cli::parse();
-
+async fn run(cli: Cli) -> Result<()> {
     // Contract v1 exit 5: after the user stopped screen sharing, input and
     // capture fail here, before a screen lookup or the daemon proxy could
     // open a portal session of their own (a remembered grant would restart
@@ -55,6 +76,7 @@ async fn run() -> Result<()> {
     }
 
     match cli.command {
+        Command::Overlay => unreachable!("handled in main"),
         Command::Doctor => {
             print_json(&doctor::doctor().await)?;
         }
@@ -85,7 +107,8 @@ async fn run() -> Result<()> {
         }
         Command::AppUnderPoint { x, y } => {
             // Always null: Shell Introspect reports no window position (see
-            // `windows::app_under_point`).
+            // `windows::app_under_point`). The overlay's own windows are
+            // override-redirect and never listed by Introspect either.
             print_json(&windows::app_under_point(x, y))?;
         }
         Command::ActivateWindow { window } => {
@@ -278,6 +301,7 @@ fn uses_portal(command: &Command) -> bool {
         | Command::Type { .. }
         | Command::HoldKey { .. } => true,
         Command::Doctor
+        | Command::Overlay
         | Command::Screens
         | Command::Windows
         | Command::CursorPosition
@@ -365,6 +389,7 @@ mod tests {
         }
         for args in [
             &["doctor"][..],
+            &["overlay"],
             &["screens"],
             &["windows"],
             &["frontmost-app"],

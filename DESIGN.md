@@ -31,7 +31,8 @@ in directly rather than copied):
 
 - **Input** = RemoteDesktop `notify_*` calls: `notify_pointer_motion_absolute`
   (stream video pixels, see "Coordinate system"), `notify_pointer_button` (evdev codes: left 272, right
-  273, middle 274), `notify_pointer_axis` (scroll), and `notify_keyboard_keysym`
+  273, middle 274), `notify_pointer_axis_discrete` (scroll, one wheel notch per
+  step), and `notify_keyboard_keysym`
   (keys, incl. Unicode-plane keysyms for arbitrary characters).
 - **Capture** = the latest PipeWire `VideoFrame` of the session's ScreenCast
   stream, converted BGRx/BGRA/RGBx/RGBA -> RGB, downscaled to the CU caps and
@@ -230,7 +231,8 @@ screens/windows are snake_case.
 
 | Subcommand | Output shape |
 |---|---|
-| `doctor` | contract v1 keys `{contract:1, bridge, version, backend:"gnome-portal", session_match, backend_reachable, backend_error, session_supported:true, restore_token_present, restore_token_path, daemon_running, session_socket}`, then extras `{xdg_current_desktop, xdg_session_type, portal_present, remote_desktop_version, screen_cast_version, mutter_present, gnome_shell_version, introspect_available, restore_token_dir (deprecated), daemon_log}` |
+| `doctor` | contract v1 keys `{contract:1, bridge, version, backend:"gnome-portal", session_match, backend_reachable, backend_error, session_supported:true, restore_token_present, restore_token_path, daemon_running, session_socket}`, then extras `{xdg_current_desktop, xdg_session_type, portal_present, remote_desktop_version, screen_cast_version, mutter_present, gnome_shell_version, introspect_available, restore_token_dir (deprecated), daemon_log, atspi, capabilities:{overlay, overlay_alpha_modifier, overlay_fractional_scale}}` (see [Overlay](#overlay)) |
+| `overlay` | not JSON-per-call: cu-overlay protocol 1, JSON lines on stdin / stdout until stdin closes (see [Overlay](#overlay)) |
 | `screens` | `[{id, name, geometry:{x,y,width,height}, scale, refresh_millihz, is_active, is_primary, is_shared?}]`; `is_shared` is present only while a session daemon answers: true iff the daemon's portal session has a stream at that screen's origin (not read by JS) |
 | `screenshot [--display <id>]` | `{base64, width, height, displayWidth, displayHeight, displayId, originX, originY}` (camelCase) |
 | `zoom [--display <id>] --x --y --w --h` | `{base64, width, height}`; with `--display` the region is display-relative, without it the region is in GLOBAL coordinates and the display under its origin is used; the region is clamped to the display |
@@ -251,7 +253,15 @@ screens/windows are snake_case.
 | `session-end` | `{ok:true, ended, daemon}`: `ended` only when a daemon was there; `daemon` is `exited`, `sigterm`, `sigkill`, `shutdown-requested` or `none` |
 | `forget-session` | `{ok:true, ended, daemon, token_removed, token_path}`: ends any daemon and deletes the restore token, so the next session shows the consent dialog (to pick other monitors); creates no directory, calls no D-Bus |
 
-The scroll axis convention matches x11-bridge: **positive `dy` scrolls down**.
+The scroll axis convention matches x11-bridge: **positive `dy` scrolls down**,
+positive `dx` right. `dx` / `dy` are **wheel notches** (rounded; any non-zero
+amount is at least one notch, at most 100 per axis), sent with
+`NotifyPointerAxisDiscrete`: Mutter emits one discrete wheel event per notch
+(a 120-unit notch to Wayland clients, a button 4-7 click to X11 clients).
+Until 0.2.0 the bridge sent `NotifyPointerAxis`, a finger-source smooth scroll
+in surface pixels: `--dy 3` moved GTK4 views by 3 px and did nothing in
+terminals (VTE, xterm) or X11 apps (measured on GNOME 48: one smooth X event
+with delta 0, no wheel button).
 Drag interpolates ~20 steps at ~8ms each.
 
 ### `--display` selection
@@ -364,6 +374,58 @@ nothing changes.
   window list), so it is never a regression. `doctor` reports
   `introspect_available` so you can tell which case you are in.
 
+## Overlay
+
+`overlay` runs Claude's Computer Use glow, drawn cursor, press ring and badge
+through the shared [cu-overlay](https://github.com/patrickjaja/cu-overlay)
+crate (protocol 1, JSON lines on stdin / stdout, `CLAUDE_CU_PARENT_PID`, the
+crate's exit codes), built with only its `x11` backend: Mutter has no
+layer-shell, so the overlay is four override-redirect ARGB XWayland windows
+(`WM_CLASS` / `_NET_WM_NAME` `claude-cu-overlay`, `_NET_WM_PID`, empty input
+shape: click-through). `main` handles it before the tokio runtime exists, so
+stdout carries protocol lines only.
+
+- **Scale hint.** From X, Mutter's physical layout mode (`layout-mode` = 2:
+  `scale-monitor-framebuffer` off, layout in physical pixels) looks exactly
+  like XWayland native scaling (layout in logical pixels, X = logical x the
+  factor): both announce the integer factor through XSETTINGS and `Xft.dpi`.
+  Before connecting, the bridge reads the layout mode from DisplayConfig (the
+  `screens` read, bounded to 1 s, no portal session) and in the physical mode
+  passes `Options { scale: Some(1) }`; in the logical mode (or when Mutter does
+  not answer) the crate detects the factor. An explicit `CU_OVERLAY_X11_SCALE`
+  wins. Measured on GNOME 48: physical mode with a 1600x1000 monitor at scale
+  2 and primary, the crate alone reported both outputs halved
+  (`Virtual-2` 640,0 800x500); the bridge reports 1280,0 1600x1000, the same
+  rect as `screens`. In the logical mode, with and without
+  `xwayland-native-scaling`, `ready.outputs` names and rects equal `screens`.
+  In the physical mode the overlay is drawn at 1 layout pixel = 1 physical
+  pixel, so on a scale-2 monitor the arrow and badge look half as big as the
+  rest of the UI.
+- **Static glow.** The crate's x11 default: every pulse step changes the
+  output-sized window's opacity and makes Mutter recomposite the whole output.
+  gnome-shell stays at ~0.1 % CPU with the glow up.
+- **Captures.** Nothing excludes the windows from the portal ScreenCast
+  stream. The caller hides them with `capture` (scope `all`; the ack comes
+  ~50 ms after the hide), THEN runs `screenshot` / `zoom` (which waits for a
+  settled fresh frame), and restores only after that returned. Measured on
+  GNOME 48 over 90 rounds (rim + arrow, glow, badge, gliding arrow, both
+  monitors, one at 1.25): no capture contained the overlay. A restore sent
+  while the capture command was still running (20 ms after it started) leaked
+  into 10 of 10 captures: the restore must wait for the capture's result.
+- **Own windows.** Introspect lists windows of tracked apps only; the
+  overlay's override-redirect windows are in Mutter's window list but never in
+  Introspect's, so `windows`, `frontmost-app` and `app-under-point` never
+  report them. The bridge has no occlusion or screenshot masking logic of its
+  own that they could disturb.
+- **`doctor` `capabilities`.** `overlay` is true in a GNOME Wayland session
+  (`session_match`) whose `$DISPLAY` is local and whose socket
+  `/tmp/.X11-unix/X<n>` exists. Mutter creates and listens on that socket
+  itself and starts XWayland on the first connection (180-270 ms cold), so
+  `doctor` only stats the socket and never connects; a Mutter without XWayland
+  sets no `$DISPLAY`. `overlay_alpha_modifier` follows `overlay` (opacity via
+  `_NET_WM_WINDOW_OPACITY`), `overlay_fractional_scale` is always false (X has
+  integer scales only): the values the backend reports in `ready`.
+
 ## Deviations from the x11/kwin contract (with rationale)
 
 - **`cursor-position`: not supported.** There is no portable GNOME/Wayland global
@@ -371,9 +433,10 @@ nothing changes.
 - **`activate-window`: not supported.** GNOME Shell Introspect exposes no
   activation. The executor's open-app path launches apps itself, so a clean
   not-supported error is correct for v0.1.
-- **`windows` is best-effort** (see above) and window `geometry` often lacks a
-  global origin on GNOME, so `app-under-point` can only resolve a hit when
-  frame-rect data is present, else returns `null`.
+- **`windows` is best-effort** (see above) and Introspect gives a window's size
+  but no position and no stacking order (`geometry` x/y are 0), so
+  `app-under-point` always returns `null`: a hit test against a made-up origin
+  would name a window that is not under the point.
 - **No `--modifier` on scroll/drag** - matches the x11/kwin surface (only click
   takes modifiers).
 

@@ -15,6 +15,9 @@ pub struct Cli {
 pub enum Command {
     /// Report desktop environment, portal, and GNOME Shell diagnostics.
     Doctor,
+    /// Run the Computer Use overlay (glow, drawn cursor, badge) on XWayland:
+    /// cu-overlay protocol 1, JSON lines on stdin / stdout.
+    Overlay,
     /// Enumerate screens (Mutter logical monitors).
     Screens,
     /// Enumerate windows (best-effort via GNOME Shell Introspect).
