@@ -498,3 +498,24 @@ fn overlay_without_a_display_is_one_fatal_error_line_and_exit_2() {
     // its own 1 s bound.
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
 }
+
+#[test]
+fn ax_features_prints_the_crates_list_without_any_bus() {
+    let output = Sandbox::new("ax-features").run(&["ax-features"]);
+    assert_eq!(code(&output), 0);
+    let printed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        printed.to_string(),
+        cu_atspi::features_json(),
+        "stdout is the crate's features_json"
+    );
+    let list: Vec<String> = serde_json::from_value(printed["ax_features"].clone()).unwrap();
+    let want: Vec<String> = cu_atspi::features()
+        .iter()
+        .map(|f| (*f).to_owned())
+        .collect();
+    assert_eq!(list, want);
+    assert_eq!(list.len(), 13);
+    let report = json(&Sandbox::new("doctor-features").run(&["doctor"]));
+    assert_eq!(report["atspi"]["features"], serde_json::json!(want));
+}

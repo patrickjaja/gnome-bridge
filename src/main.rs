@@ -251,31 +251,18 @@ async fn run(cli: Cli) -> Result<()> {
             window,
             app_id,
             title,
-            role,
-            title_contains,
-            all,
-            include_hidden,
-            max_nodes,
-            max_depth,
+            ax,
         } => {
             ax::find(ax::FindArgs {
                 window,
                 app_id,
                 title,
-                role,
-                title_contains,
-                all,
-                include_hidden,
-                max_nodes,
-                max_depth,
+                flags: ax,
             })
             .await?;
         }
-        Command::AxAction {
-            scope,
-            element_ref,
-            action,
-        } => ax::action(&scope, &element_ref, action).await?,
+        Command::AxAction { ax } => ax::action(&ax).await?,
+        Command::AxFeatures => println!("{}", cu_atspi::features_json()),
         Command::ServeSession { socket } => {
             let result = serve_session(std::path::PathBuf::from(socket)).await;
             exit_after_serve(result);
@@ -316,6 +303,7 @@ fn uses_portal(command: &Command) -> bool {
         | Command::AxRestore { .. }
         | Command::AxFind { .. }
         | Command::AxAction { .. }
+        | Command::AxFeatures
         | Command::ServeSession { .. } => false,
     }
 }
@@ -413,5 +401,136 @@ mod tests {
         ] {
             assert!(!uses_portal(&command(args)), "{args:?}");
         }
+    }
+
+    fn parse_err(args: &[&str]) -> clap::Error {
+        let mut argv = vec!["gnome-portal-bridge"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).unwrap_err()
+    }
+
+    #[test]
+    fn ax_find_flattened_flags_parse() {
+        // Today's flag sets still parse, with or without --window.
+        for args in [
+            &["ax-find", "--window", "42"][..],
+            &["ax-find", "--app-id", "org.gnome.Calculator"],
+            &[
+                "ax-find",
+                "--app-id",
+                "a",
+                "--title",
+                "t",
+                "--all",
+                "--max-depth",
+                "3",
+            ],
+            &[
+                "ax-find",
+                "--window",
+                "1",
+                "--role",
+                "AXButton",
+                "--title-contains",
+                "x",
+            ],
+            &[
+                "ax-find",
+                "--window",
+                "1",
+                "--window-ref",
+                "r",
+                "--deadline-ms",
+                "300",
+            ],
+            &[
+                "ax-find",
+                "--window",
+                "1",
+                "--root-ref",
+                "r",
+                "--scope",
+                "s",
+            ],
+            &["ax-find", "--window", "1", "--skeleton", "--max-depth", "2"],
+        ] {
+            assert!(matches!(command(args), Command::AxFind { .. }), "{args:?}");
+        }
+        let Command::AxFind {
+            app_id, title, ax, ..
+        } = command(&[
+            "ax-find",
+            "--app-id",
+            "a",
+            "--title",
+            "t",
+            "--include-hidden",
+        ])
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (app_id.as_deref(), title.as_deref()),
+            (Some("a"), Some("t"))
+        );
+        assert!(ax.include_hidden);
+        // Usage errors (exit 2).
+        for args in [
+            &["ax-find"][..],
+            &["ax-find", "--title", "x"],
+            &["ax-find", "--window", "1", "--root-ref", "r"],
+            &["ax-find", "--window", "1", "--scope", "s"],
+            &[
+                "ax-find",
+                "--window",
+                "1",
+                "--skeleton",
+                "--role",
+                "AXButton",
+            ],
+        ] {
+            assert_eq!(parse_err(args).exit_code(), 2, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn ax_action_flattened_flags_parse() {
+        for action in [
+            "click",
+            "focus",
+            "set-text",
+            "ensure-checked",
+            "ensure-unchecked",
+            "ensure-expanded",
+            "ensure-collapsed",
+            "ensure-selected",
+            "scroll-to",
+            "set-value",
+        ] {
+            let command = command(&[
+                "ax-action",
+                "--scope",
+                "s",
+                "--ref",
+                "r",
+                "--action",
+                action,
+            ]);
+            assert!(matches!(command, Command::AxAction { .. }), "{action}");
+        }
+        assert_eq!(
+            parse_err(&[
+                "ax-action",
+                "--scope",
+                "s",
+                "--ref",
+                "r",
+                "--action",
+                "type"
+            ])
+            .exit_code(),
+            2
+        );
+        assert!(!uses_portal(&command(&["ax-features"])));
     }
 }

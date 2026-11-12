@@ -159,35 +159,18 @@ pub enum Command {
         /// Window title, with --app-id.
         #[arg(long)]
         title: Option<String>,
-        /// Role filter: AX name ("AXButton") or AT-SPI name ("push button").
-        #[arg(long)]
-        role: Option<String>,
-        /// Name or description substring, case-insensitive.
-        #[arg(long)]
-        title_contains: Option<String>,
-        /// Not only interactive elements.
-        #[arg(long, default_value_t = false)]
-        all: bool,
-        /// Also walk elements that are not showing.
-        #[arg(long, default_value_t = false)]
-        include_hidden: bool,
-        #[arg(long)]
-        max_nodes: Option<usize>,
-        #[arg(long)]
-        max_depth: Option<u32>,
+        #[command(flatten)]
+        ax: cu_atspi::cli::AxFindFlags,
     },
-    /// Act on an element from `ax-find`. The text for set-text is read from
-    /// stdin (whole, UTF-8, untrimmed), never from argv.
+    /// Act on an element from `ax-find`. The text for set-text (or the JSON
+    /// for --expect-json) is read from stdin, never from argv.
     AxAction {
-        /// The `scope` value `ax-find` returned.
-        #[arg(long)]
-        scope: String,
-        /// The element's `ref` from `ax-find`.
-        #[arg(long = "ref")]
-        element_ref: String,
-        #[arg(long, value_enum)]
-        action: crate::ax::AxActionKind,
+        #[command(flatten)]
+        ax: cu_atspi::cli::AxActionFlags,
     },
+    /// Print the accessibility features of this build as JSON. Needs
+    /// no session, bus or portal.
+    AxFeatures,
     /// Internal: run the session daemon serving a bound unix socket.
     #[command(hide = true)]
     ServeSession {

@@ -1,6 +1,6 @@
 [package]
 name = "gnome-portal-bridge"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 authors = ["patrickjaja"]
@@ -20,7 +20,7 @@ serde_json = { version = "1.0.149", default-features = false, features = ["std"]
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"], default-features = false }
 libc = { version = "0.2.186", default-features = false, features = ["std"] }
 xkeysym = "0.2.1"
-cu-atspi = { git = "https://github.com/patrickjaja/cu-atspi", rev = "a390259e9209fda8bb518a8ef253198ba3435ef0" }
+cu-atspi = { git = "https://github.com/patrickjaja/cu-atspi", rev = "36f727a105dd745f0f6458cb050aa0a3f870e61b", features = ["clap"] }
 # Shared Computer Use overlay for the `overlay` subcommand: only the XWayland
 # backend (Mutter has no layer-shell), pinned by rev like cu-atspi.
 cu-overlay = { git = "https://github.com/patrickjaja/cu-overlay", rev = "a839d796e7db6532b107e35a2f9479b22c4b16c3", default-features = false, features = ["x11"] }

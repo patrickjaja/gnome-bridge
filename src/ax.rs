@@ -22,12 +22,10 @@
 //! runs in unsafe mode (`DBusSenderChecker` in `js/misc/util.js`). When it
 //! refuses, `--app-id` (and `--title`) carry the identity instead.
 
-use std::collections::HashMap;
-use std::io::Read;
-
-use anyhow::{Context, Result, bail};
-use cu_atspi::{Action, FindRequest, WindowHint};
+use anyhow::{Result, bail};
+use cu_atspi::{RequestError, WindowHint};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use zbus::zvariant::OwnedValue;
 
 use crate::output::print_json;
@@ -35,26 +33,13 @@ use crate::output::print_json;
 /// `Meta.WindowClientType.X11` as reported in `client-type`.
 const CLIENT_TYPE_X11: u32 = 1;
 
-/// The `action` values of `ax-action`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub enum AxActionKind {
-    Click,
-    Focus,
-    SetText,
-}
-
 /// The arguments of `ax-find` (see `cli::Command::AxFind`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FindArgs {
     pub window: Option<String>,
     pub app_id: Option<String>,
     pub title: Option<String>,
-    pub role: Option<String>,
-    pub title_contains: Option<String>,
-    pub all: bool,
-    pub include_hidden: bool,
-    pub max_nodes: Option<usize>,
-    pub max_depth: Option<u32>,
+    pub flags: cu_atspi::cli::AxFindFlags,
 }
 
 fn prop_str(props: &HashMap<String, OwnedValue>, key: &str) -> Option<String> {
@@ -154,34 +139,22 @@ pub fn resolve_hint(
 
 /// Bad input that is not a clap error (exit 2, contract v1 "bad usage").
 #[derive(Debug)]
-pub struct UsageError(pub &'static str);
+pub struct UsageError(pub String);
 
 impl std::fmt::Display for UsageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(&self.0)
     }
 }
 
 impl std::error::Error for UsageError {}
 
-/// Read the whole of stdin as the text for `set-text`: UTF-8, untrimmed.
-/// Invalid UTF-8 is a usage error; the bytes are never echoed.
-pub fn read_text(mut input: impl Read) -> Result<String> {
-    let mut bytes = Vec::new();
-    input
-        .read_to_end(&mut bytes)
-        .context("failed to read the text for set-text from stdin")?;
-    String::from_utf8(bytes)
-        .map_err(|_| UsageError("set-text: the text on stdin is not valid UTF-8").into())
-}
-
-/// Map the CLI action to the crate's, reading stdin only for `set-text`.
-pub fn action_from(kind: AxActionKind, stdin: impl Read) -> Result<Action> {
-    Ok(match kind {
-        AxActionKind::Click => Action::Click,
-        AxActionKind::Focus => Action::Focus,
-        AxActionKind::SetText => Action::SetText(read_text(stdin)?),
-    })
+/// `RequestError::Usage` exits 2, `RequestError::Io` exits 1.
+fn from_request_error(error: RequestError) -> anyhow::Error {
+    match error {
+        RequestError::Usage(message) => UsageError(message).into(),
+        RequestError::Io(message) => anyhow::anyhow!(message),
+    }
 }
 
 fn print_outcome<T: serde::Serialize>(
@@ -218,21 +191,20 @@ pub async fn find(args: FindArgs) -> Result<()> {
         Ok(hint) => hint,
         Err(unavailable) => return print_json(&unavailable),
     };
-    let request = FindRequest {
-        window: hint,
-        role: args.role,
-        title_contains: args.title_contains,
-        all: args.all,
-        include_hidden: args.include_hidden,
-        max_nodes: args.max_nodes,
-        max_depth: args.max_depth,
-    };
+    // `--window-ref`: when the crate accepts the ref (`window_ref_used: true`)
+    // it takes the window from the ref and never compares the hint's title,
+    // so a `--title` that no longer matches cannot fail the find; the app
+    // match (`--app-id` / wm-class) is still made first.
+    let request = args.flags.request(hint);
     print_outcome(cu_atspi::find(&request).await)
 }
 
-pub async fn action(scope: &str, element_ref: &str, kind: AxActionKind) -> Result<()> {
-    let action = action_from(kind, std::io::stdin().lock())?;
-    print_outcome(cu_atspi::action(element_ref, &action, scope).await)
+pub async fn action(flags: &cu_atspi::cli::AxActionFlags) -> Result<()> {
+    // GNOME Wayland bridge: no X11 session.
+    let request = flags
+        .request(false, std::io::stdin().lock())
+        .map_err(from_request_error)?;
+    print_outcome(cu_atspi::act(&request).await)
 }
 
 /// Cap for the `atspi` doctor probe. The crate allows itself 5 s; `doctor`
@@ -249,6 +221,7 @@ pub async fn doctor() -> cu_atspi::AtspiDoctor {
                 "accessibility probe did not finish within {} ms",
                 DOCTOR_TIMEOUT.as_millis()
             )),
+            // `Default` carries this build's `features`.
             ..Default::default()
         })
 }
@@ -375,33 +348,24 @@ mod tests {
     }
 
     #[test]
-    fn set_text_reads_whole_stdin_untrimmed_and_only_for_set_text() {
-        let text = "  line one\nzweite Zeile \u{1F600}\n\n";
-        match action_from(AxActionKind::SetText, text.as_bytes()).unwrap() {
-            Action::SetText(t) => assert_eq!(t, text),
-            other => panic!("{other:?}"),
-        }
-        match action_from(AxActionKind::SetText, &b""[..]).unwrap() {
-            Action::SetText(t) => assert_eq!(t, ""),
-            other => panic!("{other:?}"),
-        }
-        let err = action_from(AxActionKind::SetText, &b"\xff\xfe"[..]).unwrap_err();
-        assert!(err.downcast_ref::<UsageError>().is_some());
-
-        // click/focus must not consume stdin.
-        struct Panics;
-        impl Read for Panics {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
-                panic!("stdin read for a non-text action")
-            }
-        }
-        assert!(matches!(
-            action_from(AxActionKind::Click, Panics).unwrap(),
-            Action::Click
-        ));
-        assert!(matches!(
-            action_from(AxActionKind::Focus, Panics).unwrap(),
-            Action::Focus
-        ));
+    fn title_never_decides_the_window_here() {
+        // The window-ref rule (contract: `--title` need not match when
+        // `window_ref_used`) holds because this bridge only forwards the
+        // title as a hint and the crate ignores the hint's title once the
+        // ref qualifies. Even a title that matches nothing must resolve.
+        let windows = map(
+            9,
+            props(&[
+                ("app-id", ZValue::from("org.gnome.Nautilus.desktop")),
+                ("title", ZValue::from("Home")),
+            ]),
+        );
+        let mut a = args(Some("9"));
+        a.title = Some("renamed since".into());
+        a.flags.window_ref = Some(":1.4/org/a11y/atspi/accessible/1".into());
+        let hint = resolve_hint(&a, Ok(&windows)).unwrap();
+        assert_eq!(hint.app_id.as_deref(), Some("org.gnome.Nautilus"));
+        let request = a.flags.request(hint);
+        assert_eq!(request.window_ref, a.flags.window_ref);
     }
 }
