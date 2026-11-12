@@ -96,6 +96,23 @@ const SETTLE_DEADLINE: Duration = Duration::from_millis(300);
 /// After input, the first capture nudges the pointer (1 px and back) and
 /// settles again for at most this long; see `flush_after_input`.
 const FLUSH_DEADLINE: Duration = Duration::from_millis(250);
+/// A capture damages its monitor and waits for the frame Mutter records
+/// after the request (see `crate::damage` and `frames::fresh_step`).
+/// Unloaded, that frame arrives within one or two refresh intervals; Mutter
+/// records from an idle callback, which waits while gnome-shell's main loop
+/// is busy painting (measured on a software-rendered VM: up to seconds), so
+/// the deadline is long: it only applies when the screen keeps changing.
+/// It stays below the overlay's 3000 ms hide limit (cu-overlay restores a
+/// hidden overlay after 3 s), so a capture between `capture hide` and
+/// `restore` never outlasts the hide.
+const FRESH_POLICY: crate::frames::FreshPolicy = crate::frames::FreshPolicy {
+    fresh_deadline: Duration::from_millis(2500),
+    repoke: Duration::from_millis(50),
+    quiet: Duration::from_millis(70),
+    settle_cap: Duration::from_millis(200),
+};
+/// How long a failed X connection for the damage poke is not retried.
+const POKE_RETRY: Duration = Duration::from_secs(30);
 /// How long pointer input waits for a fresh stream's first frame to learn the
 /// video size before falling back to `Screen.scale`.
 const INPUT_FIRST_FRAME_WAIT: Duration = Duration::from_secs(2);
@@ -129,6 +146,10 @@ pub struct LivePortalSession {
     dead: Option<String>,
     /// Fires when the portal closes the session from its side.
     closed: ClosedWatch,
+    /// Damages a monitor so Mutter records it (see `crate::damage`).
+    poker: Option<crate::damage::DamagePoker>,
+    /// When connecting `poker` last failed.
+    poker_failed_at: Option<std::time::Instant>,
 }
 
 /// The portal's `Session::Closed` signal for one session, received by a
@@ -293,6 +314,8 @@ impl LivePortalSession {
             pointer_input_pending: false,
             dead: None,
             closed,
+            poker: None,
+            poker_failed_at: None,
         })
     }
 
@@ -371,6 +394,7 @@ impl LivePortalSession {
     /// The negotiated video size of a stream, from its latest frame.
     fn latest_video_size(&self, node_id: u32) -> Option<(u32, u32)> {
         let (frame, _) = self.pipewire.as_ref()?.frames.slot(node_id)?.latest()?;
+        let frame = frame.frame;
         (frame.width > 0 && frame.height > 0).then_some((frame.width, frame.height))
     }
 
@@ -396,6 +420,7 @@ impl LivePortalSession {
             Some(found) => found,
             None => slot.wait_newer(0, INPUT_FIRST_FRAME_WAIT).await?,
         };
+        let frame = frame.frame;
         (frame.width > 0 && frame.height > 0).then_some((frame.width, frame.height))
     }
 
@@ -736,18 +761,24 @@ impl LivePortalSession {
         self.dead.is_some()
     }
 
-    /// The latest PipeWire frame of the screen's stream: on a fresh stream the
-    /// first frame (bounded wait), else the last frame once the stream settles
-    /// (see `SETTLE_QUIET`), else the stored latest frame. The first capture
-    /// of the pointer's screen after pointer input also flushes a repaint
-    /// Mutter may be holding back.
+    /// A PipeWire frame of the screen's stream that shows everything changed
+    /// before this call: on a fresh stream the first frame (bounded wait);
+    /// else the screen is damaged through XWayland and the first frame
+    /// Mutter records after the request is used, once the stream settles
+    /// (`FRESH_POLICY`, `frames::fresh_step`). Without XWayland: the last
+    /// frame once the stream settles (`SETTLE_QUIET`), with the pointer
+    /// nudge after pointer input.
     async fn capture_frame(&mut self, screen: &Screen) -> Result<Arc<VideoFrame>> {
+        // Everything that changed before this instant must be in the image.
+        let request_ns = crate::frames::monotonic_ns();
         let stream = self.resolve_stream(screen).await?;
         let node_id = stream.node_id;
         self.ensure_stream(node_id, stream.size.0, stream.size.1)
             .await?;
-        let pw = self.pipewire.as_ref().expect("pipewire initialized");
-        let slot = pw
+        let slot = self
+            .pipewire
+            .as_ref()
+            .expect("pipewire initialized")
             .frames
             .slot(node_id)
             .context("PipeWire stream has no frame slot")?;
@@ -765,24 +796,91 @@ impl LivePortalSession {
             // A fresh stream's first frame is rendered from the current
             // stage, so it needs no flush.
             return match slot.wait_newer(0, FIRST_FRAME_TIMEOUT).await {
-                Some((frame, _)) => Ok(frame),
+                Some((first, _)) => Ok(first.frame),
                 None => bail!(
                     "timed out waiting for PipeWire frame on stream {node_id} ({})",
-                    pw.frames.state_summary()
+                    self.pipewire
+                        .as_ref()
+                        .map(|pw| pw.frames.state_summary())
+                        .unwrap_or_default()
                 ),
             };
         };
+        // Make Mutter record this monitor now and take only a frame
+        // recorded after the request (see `crate::damage`).
+        if self.poke_monitor(&screen.id) {
+            let id = screen.id.clone();
+            if let Some((frame, fresh)) =
+                crate::frames::capture_fresh(&slot, request_ns, &FRESH_POLICY, || {
+                    self.poke_monitor(&id)
+                })
+                .await
+            {
+                if !fresh {
+                    eprintln!(
+                        "gnome-portal-bridge: no frame of {} recorded within {} ms of the \
+                         request (Mutter busy); using the latest, {} ms old",
+                        screen.id,
+                        FRESH_POLICY.fresh_deadline.as_millis(),
+                        (request_ns - frame.recorded_ns) / 1_000_000
+                    );
+                }
+                return Ok(frame.frame);
+            }
+        }
+        // No X server to damage the monitor with: settle on what Mutter
+        // sends (a static monitor sends nothing; the stored frame is then
+        // the latest it recorded), plus the pointer nudge after input.
         let (frame, seq) = slot
             .settle(seq, SETTLE_QUIET, SETTLE_DEADLINE)
             .await
             .unwrap_or((stored, seq));
         let Some(nudge_dx) = nudge.filter(|_| self.held_buttons.is_empty()) else {
-            return Ok(frame);
+            return Ok(frame.frame);
         };
         Ok(self
             .flush_after_input(&slot, seq, nudge_dx)
             .await
-            .map_or(frame, |(fresh, _)| fresh))
+            .map_or(frame.frame, |(fresh, _)| fresh.frame))
+    }
+
+    /// Damage one pixel of monitor `screen_id` so Mutter records a frame of
+    /// it; false when that is not possible (no XWayland, a stream-derived
+    /// screen without a connector name). A failed connection is retried on
+    /// the next capture after `POKE_RETRY`.
+    fn poke_monitor(&mut self, screen_id: &str) -> bool {
+        if self.poker.is_none() {
+            if self
+                .poker_failed_at
+                .is_some_and(|at| at.elapsed() < POKE_RETRY)
+            {
+                return false;
+            }
+            match crate::damage::DamagePoker::connect() {
+                Ok(poker) => self.poker = Some(poker),
+                Err(error) => {
+                    eprintln!(
+                        "gnome-portal-bridge: cannot damage monitors through X ({error:#}); \
+                         captures settle on the stream instead"
+                    );
+                    self.poker_failed_at = Some(std::time::Instant::now());
+                    return false;
+                }
+            }
+        }
+        let poker = self.poker.as_mut().expect("poker just set");
+        match poker.poke(screen_id) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("gnome-portal-bridge: damage poke on {screen_id} failed: {error:#}");
+                // A broken connection reconnects next time; an unknown
+                // monitor name keeps the connection.
+                if poker.is_broken() {
+                    self.poker = None;
+                }
+                false
+            }
+        }
     }
 
     /// Make Mutter record the repaint an input action caused, and wait for it.
@@ -804,10 +902,10 @@ impl LivePortalSession {
     /// (it would drag) or before the session placed the pointer at all.
     async fn flush_after_input(
         &self,
-        slot: &crate::frames::LatestSlot<Arc<VideoFrame>>,
+        slot: &crate::frames::LatestSlot<crate::frames::Stamped>,
         seq: u64,
         nudge_dx: f64,
-    ) -> Option<(Arc<VideoFrame>, u64)> {
+    ) -> Option<(crate::frames::Stamped, u64)> {
         let remote = self.manager.remote_desktop();
         let session = self.session.ashpd_session();
         if let Err(error) = remote.notify_pointer_motion(session, nudge_dx, 0.0).await {

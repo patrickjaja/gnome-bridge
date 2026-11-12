@@ -26,7 +26,7 @@ until run on a real GNOME Wayland session (see `scripts/manual-test-gnome.md`).
 | Concern | Old (shell-out) | New (this bridge) |
 |---|---|---|
 | Input | `ydotool` (+`ydotoold`, else x11-bridge over XWayland) | portal RemoteDesktop `notify_*` |
-| Screenshot | 4-tier cascade (below) | one portal ScreenCast PipeWire frame -> JPEG |
+| Screenshot | 4-tier cascade (below) | one portal ScreenCast PipeWire frame recorded after the request -> JPEG |
 | Windows | *(none on GNOME)* | `org.gnome.Shell.Introspect` (best-effort) |
 | Screens | *(Electron only)* | `org.gnome.Mutter.DisplayConfig` |
 
@@ -44,6 +44,10 @@ legacy python path's token file.
 
 - A **GNOME Wayland** session (GNOME 42+; persistence needs 46+).
 - `xdg-desktop-portal` + `xdg-desktop-portal-gnome` and **PipeWire** running.
+- XWayland (Mutter starts it on demand) for capture freshness: a capture
+  damages one transparent pixel of the monitor through a 1x1 click-through
+  X window, so Mutter records a frame after the request (DESIGN.md "Capture
+  freshness"). Without it, captures settle on whatever the stream sends.
 - For window enumeration: the caller must be on GNOME Shell's Introspect
   allowlist or `org.gnome.mutter unsafe-mode` on. Otherwise `windows` returns
   `[]` (no regression - GNOME has no window list today).

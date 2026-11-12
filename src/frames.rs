@@ -141,7 +141,206 @@ impl<T: Clone> LatestSlot<T> {
     }
 }
 
-type Slots = Arc<Mutex<HashMap<u32, Arc<LatestSlot<Arc<VideoFrame>>>>>>;
+/// A frame with the time Mutter recorded it.
+#[derive(Clone)]
+pub struct Stamped {
+    pub frame: Arc<VideoFrame>,
+    /// CLOCK_MONOTONIC ns at which Mutter recorded the frame: the PipeWire
+    /// buffer's `spa_meta_header.pts`. For a memory-buffer stream Mutter
+    /// sets it to `g_get_monotonic_time()` at the moment it paints the
+    /// monitor into the buffer, so the frame shows the screen as of then.
+    /// Without a header (pts 0) the arrival time is used instead (later than
+    /// the recording, never earlier).
+    pub recorded_ns: i64,
+}
+
+impl Stamped {
+    pub fn new(frame: VideoFrame, arrived_ns: i64) -> Self {
+        let pts = frame.meta.header.as_ref().map_or(0, |h| h.pts);
+        Self {
+            recorded_ns: recorded_ns(pts, arrived_ns),
+            frame: Arc::new(frame),
+        }
+    }
+}
+
+/// The record time of a frame: Mutter's pts when it has one that is not in
+/// the future, else its arrival time.
+fn recorded_ns(pts: i64, arrived_ns: i64) -> i64 {
+    if pts > 0 && pts <= arrived_ns {
+        pts
+    } else {
+        arrived_ns
+    }
+}
+
+/// A slot value that knows when Mutter recorded it.
+pub trait RecordedAt {
+    fn recorded_ns(&self) -> i64;
+}
+
+impl RecordedAt for Stamped {
+    fn recorded_ns(&self) -> i64 {
+        self.recorded_ns
+    }
+}
+
+/// CLOCK_MONOTONIC in ns, the clock of Mutter's frame timestamps.
+pub fn monotonic_ns() -> i64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: one valid timespec; CLOCK_MONOTONIC always exists on Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec * 1_000_000_000 + ts.tv_nsec
+}
+
+/// Timing of a fresh capture (see `fresh_step`).
+#[derive(Debug, Clone, Copy)]
+pub struct FreshPolicy {
+    /// How long to wait for a frame recorded after the request.
+    pub fresh_deadline: Duration,
+    /// Damage the monitor again when no fresh frame came this long after
+    /// the last poke: Mutter skips a paint that comes within one refresh
+    /// interval of its last recording and leaves it to a follow-up redraw,
+    /// which does not always record (measured: GNOME 48, second monitor).
+    pub repoke: Duration,
+    /// After the first fresh frame: stop once no frame came for this long.
+    pub quiet: Duration,
+    /// After the first fresh frame: stop at the latest this long later.
+    pub settle_cap: Duration,
+}
+
+/// What a fresh capture does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreshStep {
+    /// Wait for the next frame, at most until this CLOCK_MONOTONIC ns.
+    WaitUntil(i64),
+    /// Damage the monitor again, then ask again.
+    Poke,
+    /// Done: the latest frame is fresh and the stream settled.
+    Take,
+    /// Done: no frame recorded after the request came in time.
+    GiveUp,
+}
+
+/// Arrival times (CLOCK_MONOTONIC ns) of the frames recorded after the
+/// request: the first and the latest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FreshArrivals {
+    pub first: i64,
+    pub last: i64,
+}
+
+fn ns(d: Duration) -> i64 {
+    i64::try_from(d.as_nanos()).unwrap_or(i64::MAX)
+}
+
+/// The frame-selection rule of a capture requested at `request_ns`.
+///
+/// Only a frame Mutter recorded at or after the request counts (`fresh`):
+/// it was painted from the stage after the request, so it contains every
+/// change made before it. Until one arrived, wait (up to `fresh_deadline`
+/// after the request). After the first one, keep taking newer frames until
+/// none came for `quiet` or `settle_cap` passed since the first: an input
+/// action's own cursor frame is often recorded before the application
+/// repainted. While no fresh frame came, a capture that damages the
+/// monitor (`last_poke_ns` set) does so again every `repoke`. Pure, so the
+/// rule is tested without PipeWire.
+pub fn fresh_step(
+    policy: &FreshPolicy,
+    request_ns: i64,
+    fresh: Option<FreshArrivals>,
+    last_poke_ns: Option<i64>,
+    now_ns: i64,
+) -> FreshStep {
+    match fresh {
+        None => {
+            let until = request_ns.saturating_add(ns(policy.fresh_deadline));
+            if now_ns >= until {
+                return FreshStep::GiveUp;
+            }
+            match last_poke_ns {
+                Some(poked) => {
+                    let repoke = poked.saturating_add(ns(policy.repoke));
+                    if now_ns >= repoke {
+                        FreshStep::Poke
+                    } else {
+                        FreshStep::WaitUntil(until.min(repoke))
+                    }
+                }
+                None => FreshStep::WaitUntil(until),
+            }
+        }
+        Some(arrivals) => {
+            let until = arrivals
+                .last
+                .saturating_add(ns(policy.quiet))
+                .min(arrivals.first.saturating_add(ns(policy.settle_cap)));
+            if now_ns >= until {
+                FreshStep::Take
+            } else {
+                FreshStep::WaitUntil(until)
+            }
+        }
+    }
+}
+
+/// Run `fresh_step` against a slot: returns the frame to use and whether it
+/// was recorded after `request_ns` (false: the latest frame, after
+/// `fresh_deadline` passed without a fresh one).
+/// The caller damaged the monitor right before; `poke` damages it again
+/// (true when it could), once per `FreshStep::Poke`.
+pub async fn capture_fresh<T: Clone + RecordedAt>(
+    slot: &LatestSlot<T>,
+    request_ns: i64,
+    policy: &FreshPolicy,
+    mut poke: impl FnMut() -> bool,
+) -> Option<(T, bool)> {
+    let (mut latest, mut seq) = slot.latest()?;
+    let mut fresh: Option<FreshArrivals> = None;
+    let note = |value: &T, fresh: &mut Option<FreshArrivals>| {
+        if value.recorded_ns() >= request_ns {
+            let now = monotonic_ns();
+            *fresh = Some(match *fresh {
+                None => FreshArrivals {
+                    first: now,
+                    last: now,
+                },
+                Some(a) => FreshArrivals { last: now, ..a },
+            });
+        }
+    };
+    note(&latest, &mut fresh);
+    let mut last_poke = Some(monotonic_ns());
+    loop {
+        match fresh_step(policy, request_ns, fresh, last_poke, monotonic_ns()) {
+            FreshStep::Take => return Some((latest, true)),
+            FreshStep::GiveUp => return Some((latest, false)),
+            FreshStep::Poke => {
+                // A failed poke keeps the old time: retried next interval.
+                if poke() {
+                    last_poke = Some(monotonic_ns());
+                } else {
+                    last_poke = last_poke.map(|p| p + ns(policy.repoke));
+                }
+            }
+            FreshStep::WaitUntil(until) => {
+                let wait = Duration::from_nanos(
+                    u64::try_from(until.saturating_sub(monotonic_ns())).unwrap_or(0),
+                );
+                if let Some((value, newer)) = slot.wait_newer(seq, wait).await {
+                    note(&value, &mut fresh);
+                    latest = value;
+                    seq = newer;
+                }
+            }
+        }
+    }
+}
+
+type Slots = Arc<Mutex<HashMap<u32, Arc<LatestSlot<Stamped>>>>>;
 
 /// Owns the PipeWire thread (through the drainer) and the per-stream latest
 /// frame slots.
@@ -226,7 +425,7 @@ impl FrameSource {
     }
 
     /// The latest-frame slot of a stream, if the stream was created.
-    pub fn slot(&self, stream_id: u32) -> Option<Arc<LatestSlot<Arc<VideoFrame>>>> {
+    pub fn slot(&self, stream_id: u32) -> Option<Arc<LatestSlot<Stamped>>> {
         lock(&self.slots).get(&stream_id).cloned()
     }
 
@@ -295,7 +494,7 @@ fn drain(
         };
         let slot = lock(&slots).get(&stream_id).cloned();
         if let Some(slot) = slot {
-            slot.publish(Arc::new(frame));
+            slot.publish(Stamped::new(frame, monotonic_ns()));
         }
     };
 
@@ -459,6 +658,231 @@ mod tests {
         assert_eq!(slot.latest(), Some((9, 1)));
     }
 
+    const MS: i64 = 1_000_000;
+    const POLICY: FreshPolicy = FreshPolicy {
+        fresh_deadline: Duration::from_millis(4000),
+        repoke: Duration::from_millis(50),
+        quiet: Duration::from_millis(70),
+        settle_cap: Duration::from_millis(200),
+    };
+
+    #[test]
+    fn without_a_fresh_frame_the_monitor_is_damaged_again() {
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, None, Some(1001 * MS), 1020 * MS),
+            FreshStep::WaitUntil(1051 * MS)
+        );
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, None, Some(1001 * MS), 1051 * MS),
+            FreshStep::Poke
+        );
+        // The deadline still wins over a poke.
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, None, Some(4990 * MS), 5000 * MS),
+            FreshStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn without_a_fresh_frame_the_capture_waits_until_the_deadline() {
+        // Static monitor not yet recorded, or Mutter busy: wait.
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, None, None, 1000 * MS),
+            FreshStep::WaitUntil(5000 * MS)
+        );
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, None, None, 4999 * MS),
+            FreshStep::WaitUntil(5000 * MS)
+        );
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, None, None, 5000 * MS),
+            FreshStep::GiveUp
+        );
+    }
+
+    #[test]
+    fn a_fresh_frame_is_taken_after_the_quiet_gap() {
+        // Static screen: the poke's frame at +25 ms, nothing after it.
+        let one = FreshArrivals {
+            first: 1025 * MS,
+            last: 1025 * MS,
+        };
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, Some(one), Some(1000 * MS), 1050 * MS),
+            FreshStep::WaitUntil(1095 * MS)
+        );
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, Some(one), Some(1000 * MS), 1095 * MS),
+            FreshStep::Take
+        );
+    }
+
+    #[test]
+    fn continuous_frames_end_at_the_settle_cap() {
+        // A video on the monitor: frames every 16 ms never leave a quiet
+        // gap, the cap ends the capture 200 ms after the first fresh one.
+        let busy = FreshArrivals {
+            first: 1010 * MS,
+            last: 1200 * MS,
+        };
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, Some(busy), Some(1000 * MS), 1201 * MS),
+            FreshStep::WaitUntil(1210 * MS)
+        );
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, Some(busy), Some(1000 * MS), 1210 * MS),
+            FreshStep::Take
+        );
+    }
+
+    #[test]
+    fn a_late_fresh_frame_still_settles() {
+        // Mutter busy for 2 s: the first fresh frame at +2000 ms.
+        let late = FreshArrivals {
+            first: 3000 * MS,
+            last: 3000 * MS,
+        };
+        assert_eq!(
+            fresh_step(&POLICY, 1000 * MS, Some(late), Some(2950 * MS), 3000 * MS),
+            FreshStep::WaitUntil(3070 * MS)
+        );
+    }
+
+    #[test]
+    fn record_time_is_the_pts_unless_missing_or_in_the_future() {
+        assert_eq!(recorded_ns(900, 1000), 900);
+        assert_eq!(recorded_ns(0, 1000), 1000);
+        assert_eq!(recorded_ns(1500, 1000), 1000);
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct At(i64, u32);
+    impl RecordedAt for At {
+        fn recorded_ns(&self) -> i64 {
+            self.0
+        }
+    }
+
+    const QUICK: FreshPolicy = FreshPolicy {
+        fresh_deadline: Duration::from_millis(400),
+        repoke: Duration::from_millis(50),
+        quiet: Duration::from_millis(40),
+        settle_cap: Duration::from_millis(150),
+    };
+
+    #[tokio::test]
+    async fn a_stored_frame_older_than_the_request_is_not_returned_while_a_fresh_one_comes() {
+        // The bug: the stored frame was recorded before the screen changed;
+        // Mutter records the change 120 ms after the request.
+        let slot = Arc::new(LatestSlot::new());
+        let request = monotonic_ns();
+        slot.publish(At(request - 2000 * MS, 1));
+        let publisher = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(120));
+                slot.publish(At(monotonic_ns(), 2));
+            })
+        };
+        let (got, fresh) = capture_fresh(&slot, request, &QUICK, || true)
+            .await
+            .unwrap();
+        publisher.join().unwrap();
+        assert!(fresh);
+        assert_eq!(got.1, 2);
+    }
+
+    #[tokio::test]
+    async fn the_newest_frame_of_a_burst_is_returned() {
+        let slot = Arc::new(LatestSlot::new());
+        let request = monotonic_ns();
+        slot.publish(At(request - 50 * MS, 0));
+        let publisher = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                for n in 1..=3 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    slot.publish(At(monotonic_ns(), n));
+                }
+            })
+        };
+        let started = std::time::Instant::now();
+        let (got, fresh) = capture_fresh(&slot, request, &QUICK, || true)
+            .await
+            .unwrap();
+        publisher.join().unwrap();
+        assert!(fresh);
+        assert_eq!(got.1, 3);
+        // Last frame at ~30 ms + 40 ms quiet.
+        assert!(
+            started.elapsed() < Duration::from_millis(140),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_monitor_is_damaged_again_until_a_fresh_frame_comes() {
+        // Mutter ignores the first two pokes (a skipped paint); the third
+        // produces the frame.
+        let slot = Arc::new(LatestSlot::new());
+        let request = monotonic_ns();
+        slot.publish(At(request - 1000 * MS, 0));
+        let mut pokes = 0;
+        let poke_slot = Arc::clone(&slot);
+        let (got, fresh) = capture_fresh(&slot, request, &QUICK, || {
+            pokes += 1;
+            if pokes == 3 {
+                poke_slot.publish(At(monotonic_ns(), 9));
+            }
+            true
+        })
+        .await
+        .unwrap();
+        assert!(fresh);
+        assert_eq!(got.1, 9);
+        assert_eq!(pokes, 3);
+        // (the caller's own first poke plus three re-pokes)
+    }
+
+    #[tokio::test]
+    async fn without_any_fresh_frame_the_latest_is_returned_marked_stale() {
+        let slot = LatestSlot::new();
+        let request = monotonic_ns();
+        slot.publish(At(request - 10 * MS, 7));
+        let started = std::time::Instant::now();
+        let (got, fresh) = capture_fresh(&slot, request, &QUICK, || true)
+            .await
+            .unwrap();
+        assert!(!fresh);
+        assert_eq!(got.1, 7);
+        assert!(started.elapsed() >= Duration::from_millis(400));
+    }
+
+    #[tokio::test]
+    async fn a_frame_of_another_time_does_not_end_the_wait_early() {
+        // A late-arriving frame recorded BEFORE the request (queued while
+        // the capture began) does not count as fresh.
+        let slot = Arc::new(LatestSlot::new());
+        let request = monotonic_ns();
+        slot.publish(At(request - 100 * MS, 1));
+        let publisher = {
+            let slot = Arc::clone(&slot);
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(10));
+                slot.publish(At(request - 5 * MS, 2));
+                std::thread::sleep(Duration::from_millis(100));
+                slot.publish(At(monotonic_ns(), 3));
+            })
+        };
+        let (got, fresh) = capture_fresh(&slot, request, &QUICK, || true)
+            .await
+            .unwrap();
+        publisher.join().unwrap();
+        assert!(fresh);
+        assert_eq!(got.1, 3);
+    }
+
     #[test]
     fn early_empty_poll_means_disconnected() {
         assert!(returned_early(Duration::from_millis(1)));
@@ -485,7 +909,7 @@ mod tests {
             .unwrap();
         let slot = source.slot(1).unwrap();
         let (frame, _) = slot.wait_newer(0, Duration::from_secs(5)).await.unwrap();
-        assert_eq!((frame.width, frame.height), (4, 2));
+        assert_eq!((frame.frame.width, frame.frame.height), (4, 2));
         assert!(source.is_alive());
 
         drop(raw_tx);

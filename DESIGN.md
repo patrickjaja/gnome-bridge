@@ -40,12 +40,49 @@ in directly rather than copied):
   the NEWEST frame when full, so popping one frame per screenshot returns an
   ever older frame under activity (and holds up to 256 full frames). A drainer
   thread therefore owns the PipeWire thread manager, empties that queue
-  continuously and keeps only the latest frame per stream. A screenshot
-  collects new frames until none arrives for 70 ms (or 300 ms passed) and uses
-  the last one: the action's own cursor motion often produces a cursor-only
-  frame before the application repainted, so the first new frame is not
-  enough. Mutter emits frames on damage or cursor motion only; on a static
-  screen none comes and the stored frame (already current) is used. Mutter
+  continuously and keeps only the latest frame per stream, stamped with the
+  time Mutter recorded it (the buffer's `spa_meta_header.pts`,
+  CLOCK_MONOTONIC; the arrival time when a buffer has no header).
+- **Capture freshness.** A screenshot or zoom notes the request time,
+  damages one transparent pixel of the captured monitor (`src/damage.rs`: a
+  1x1 override-redirect ARGB XWayland window per monitor, empty input shape,
+  `ClearArea` per capture), and takes only a frame Mutter recorded at or after
+  the request. Mutter paints a memory-buffer monitor stream into the buffer at
+  record time, so such a frame contains every change made before the request.
+  After the first fresh frame it keeps taking newer ones until none came for
+  70 ms (at most 200 ms after the first): an action's own cursor frame is
+  often recorded before the application repainted. Without a fresh frame it
+  damages the pixel again every 50 ms (Mutter skips a paint inside one refresh
+  interval of its last recording and leaves it to a follow-up redraw that did
+  not always record the second monitor) and gives up after 2.5 s (below the
+  overlay's 3 s hide limit, so a capture inside `capture hide` .. `restore`
+  never outlasts the hide), returning the
+  latest frame with a `daemon.log` line naming its age. The rule is the pure
+  `frames::fresh_step`, unit-tested over arrival and record times.
+  Why it has to wait instead of forcing: for memory buffers Mutter records
+  from an idle callback (`maybe_record_frame_on_idle`, `G_PRIORITY_DEFAULT_IDLE`)
+  that a paint of the monitor's view schedules, and while that idle is pending
+  later paints schedule nothing. When gnome-shell's main loop is busy painting
+  (continuous animation, software rendering) the idle waits: measured on
+  GNOME 48 in a VM with llvmpipe and two shared monitors, both streams went
+  without any recorded frame for 0.3-11 s while the screen itself kept
+  changing (VirtualBox's framebuffer showed the new content, Mutter's
+  `SCREEN_CAST` debug log showed no recording at all, and an idle-priority
+  probe inside gnome-shell was starved for exactly those intervals). Until
+  0.2.0 a capture settled for at most 300 ms and then returned the stored
+  frame, however old: with the overlay hidden 50 ms before, 2 of 26 in-app
+  screenshots still showed it, about 2 s old. Neither damage nor pointer
+  input can make a starved idle run sooner; waiting for the recorded frame
+  is the only correct answer, and it costs nothing when Mutter is idle: on a
+  static screen the poke's frame arrives within one or two refresh intervals,
+  so a capture takes about 100 ms in the daemon instead of the old 300 ms
+  settle. Without XWayland (`$DISPLAY` unset, connection refused, a
+  stream-derived screen without a connector name) a capture falls back to the
+  old settle and the pointer nudge below.
+- **Fallback settle (no XWayland).** A screenshot collects new frames until
+  none arrives for 70 ms (or 300 ms passed) and uses the last one. Mutter
+  emits frames on damage or cursor motion only; on a static screen none comes
+  and the stored frame is used. Mutter
   also records a stream at most once per refresh interval: damage inside that
   interval is held back for a "follow-up" redraw of the monitor's view, and
   with an embedded cursor nothing else records the stream. That follow-up can

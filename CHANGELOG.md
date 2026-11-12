@@ -4,6 +4,25 @@ All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## 2026-11-12 (0.2.1)
+
+### Fixed
+
+- **Screenshots could show the screen as it was seconds earlier.** For
+  memory-buffer streams Mutter records a frame from an idle callback, which
+  waits while gnome-shell's main loop is busy painting (continuous
+  animation, software rendering, two monitors); meanwhile the screen keeps
+  changing but no frame is sent. A capture settled for 300 ms and then used
+  the stored frame, however old: on GNOME 48 with two monitors, a hidden
+  overlay still showed in 2 of 26 in-app screenshots and a scroll was missing
+  1.7 s later. A capture now damages one transparent pixel of the captured
+  monitor through XWayland (a 1x1 click-through override-redirect window)
+  and uses only a frame Mutter recorded after the request, waiting up to
+  2.5 s for it. On an idle desktop that frame arrives within one or two
+  refresh intervals, so a capture of a static screen is faster than before
+  (about 100 ms in the daemon instead of the 300 ms settle). Without
+  XWayland the old settle is used. See DESIGN.md "Capture freshness".
+
 ## 2026-11-12 (0.2.0)
 
 ### Added

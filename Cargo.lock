@@ -661,7 +661,7 @@ checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "gnome-portal-bridge"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -676,6 +676,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "x11rb",
  "xkeysym",
  "zbus",
 ]

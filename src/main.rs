@@ -2,6 +2,7 @@ mod ax;
 mod capture;
 mod cli;
 mod daemon;
+mod damage;
 mod doctor;
 mod error_kind;
 mod frames;
