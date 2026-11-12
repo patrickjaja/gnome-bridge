@@ -4,7 +4,7 @@
 //! allowlist-restricted: it succeeds only when the caller is on GNOME Shell's
 //! introspection allowlist or `org.gnome.mutter unsafe-mode` is enabled.
 //! Otherwise the call returns a D-Bus error. In that case `list_windows`
-//! returns an empty vector and `frontmost_app` / `app_under_point` return
+//! returns an empty vector and `frontmost_app` returns
 //! `null` - which is the status quo on GNOME today (the JS executor has no
 //! window enumeration on GNOME/Wayland), so this is additive, never a
 //! regression.
@@ -172,28 +172,18 @@ pub async fn frontmost_app(connection: &Connection) -> Option<AppRef> {
         .map(app_ref_from_window)
 }
 
-/// The topmost app whose geometry contains the point, or `None`.
+/// The topmost app at a global point: always `None` on GNOME.
 ///
-/// Introspect window geometry lacks a global origin on many GNOME versions
-/// (only width/height are guaranteed), so this is best-effort: it can only
-/// resolve a hit when frame-rect data is present. When geometry is unusable it
-/// returns `None`, matching the "no window list on GNOME" baseline.
-pub async fn app_under_point(connection: &Connection, x: i32, y: i32) -> Option<AppRef> {
-    let windows = list_windows(connection).await;
-    windows
-        .iter()
-        .filter(|w| {
-            let g = &w.geometry;
-            g.width > 0
-                && g.height > 0
-                && x >= g.x
-                && x < g.x + g.width
-                && y >= g.y
-                && y < g.y + g.height
-        })
-        // Later stacking order = higher; pick the topmost.
-        .max_by_key(|w| w.stacking_order)
-        .map(app_ref_from_window)
+/// Shell Introspect reports a window's size but no position (GNOME Shell 45
+/// to 51, `js/misc/introspect.js`), and no stacking order, so no hit test is
+/// possible. An earlier version tested the point against `(0, 0, width,
+/// height)` and named a window that is not there: measured on GNOME 48 with
+/// unsafe-mode on, a point on an empty desktop on the left monitor returned
+/// a Text Editor window that sat on the right monitor, and a point inside
+/// that window returned `null`. `null` is what the executor already handles
+/// on GNOME (no window list without the allowlist).
+pub fn app_under_point(_x: i32, _y: i32) -> Option<AppRef> {
+    None
 }
 
 #[cfg(test)]
@@ -237,6 +227,12 @@ mod tests {
             exclude_from_capture: false,
             keep_above: None,
         }
+    }
+
+    #[test]
+    fn app_under_point_is_never_guessed() {
+        assert!(app_under_point(400, 300).is_none());
+        assert!(app_under_point(0, 0).is_none());
     }
 
     #[test]

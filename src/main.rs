@@ -84,11 +84,9 @@ async fn run() -> Result<()> {
             }
         }
         Command::AppUnderPoint { x, y } => {
-            let connection = zbus::Connection::session().await?;
-            match windows::app_under_point(&connection, x, y).await {
-                Some(app) => print_json(&app)?,
-                None => print_json(&serde_json::Value::Null)?,
-            }
+            // Always null: Shell Introspect reports no window position (see
+            // `windows::app_under_point`).
+            print_json(&windows::app_under_point(x, y))?;
         }
         Command::ActivateWindow { window } => {
             // GNOME Shell Introspect has no activate; the executor's open-app
