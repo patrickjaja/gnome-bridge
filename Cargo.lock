@@ -426,7 +426,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 [[package]]
 name = "cu-atspi"
 version = "0.1.0"
-source = "git+https://github.com/patrickjaja/cu-atspi?rev=30ff9c84332569aadb4b83364cfdc89fa7ca6a04#30ff9c84332569aadb4b83364cfdc89fa7ca6a04"
+source = "git+https://github.com/patrickjaja/cu-atspi?rev=0e0ff055f3095865e00c20b168a721bbe28339fa#0e0ff055f3095865e00c20b168a721bbe28339fa"
 dependencies = [
  "atspi-common",
  "clap",
